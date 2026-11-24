@@ -5,7 +5,7 @@
 <!-- AirFrameXR overview: editorial refresh -->
 # AirFrameXR
 
-[中文启动器](tools/localizer/README.md) | [简体中文](README.zh-CN.md) | [English](README.md)
+[原项目](https://github.com/jfbobier/AirFrameXR) | [中文启动器](tools/localizer/README.md) | [简体中文](README.zh-CN.md) | [English](README.md)
 
 **为追求高性能与简洁体验的玩家打造的无线 PCVR。针对 NVIDIA 重新设计。无需 SteamVR。可选集成式帧生成。**
 
