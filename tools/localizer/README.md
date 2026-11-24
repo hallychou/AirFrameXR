@@ -12,6 +12,8 @@ powershell -ExecutionPolicy Bypass -File tools\localizer\build.ps1
 
 将 `out\localizer\ChineseLauncher.exe` 和 `out\localizer\zh-CN.json` 复制到已解压的 AirFrameXR 文件夹根目录（与 `AirFrameXR.exe` 同级），然后运行 `ChineseLauncher.exe`。原有 `AirFrameXR.exe` 仍可照常使用；使用原入口启动时，汉化器不会运行。
 
+也可以在 GitHub 仓库的 **Actions** 页面手动运行 **Build Chinese Launcher** 工作流。成功后，从该次运行的 Artifacts 下载 `AirFrameXR-ChineseLauncher`，其中包含启动器和翻译表。
+
 ## 维护翻译
 
 编辑 `zh-CN.json`：键应与界面控件当前显示的英文完全一致，值为中文译文。动态句子可在键和值中使用 `{0}`、`{1}` 等占位符；匹配时会保留对应的实际内容。保存后重新运行汉化启动器即可生效，不需要重新编译启动器。可以先在界面中记录遗漏的英文，再将完整英文文本作为新键加入 JSON。

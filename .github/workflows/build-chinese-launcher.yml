@@ -1,0 +1,30 @@
+name: Build Chinese Launcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build launcher and translation table
+        shell: pwsh
+        run: .\tools\localizer\build.ps1
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirFrameXR-ChineseLauncher
+          path: |
+            out/localizer/ChineseLauncher.exe
+            out/localizer/zh-CN.json
+          if-no-files-found: error
+          retention-days: 30
