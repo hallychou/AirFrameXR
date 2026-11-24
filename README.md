@@ -5,6 +5,8 @@
 <!-- AirFrameXR overview: editorial refresh -->
 # AirFrameXR
 
+[中文启动器](tools/localizer/README.md) | [简体中文](README.zh-CN.md) | [English](README.md)
+
 **Wireless PCVR for people who want high performance and simplicity. Re-engineered for NVIDIA. No SteamVR required. Optional integrated frame generation.**
 
 <p align="center">
