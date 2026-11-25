@@ -52,6 +52,10 @@ AirFrameXR 面向使用无线头显和 NVIDIA GPU、希望游戏运行更快又�
 - **原生 Windows 工具**。提供统一启动器，以及串流器、统计、诊断和设置等原生窗口；还可选配在头显内使用的桌面镜像。
 - **保持简洁**。采用便携式分发、易读的设置和针对性工具，不试图成为通用 SteamVR 替代品。
 
+<p align="center">
+  <img src="docs/images/airframexr-neural-fg.png" alt="面向 NVIDIA 的神经网络帧生成：RIFE 从真实视频中学习运动，在串流器中为每对游戏帧预测中间帧；自研 CUDA 引擎以 11 MB 取代 RTX 版 TensorRT 的 210 MB，同时保持相同画面。NVENC、光流、CUDA 和 D3D11 互操作都在同一块 NVIDIA GPU 上运行。" width="100%">
+</p>
+
 ### 性能：用测量说话，不作空头承诺
 
 **维护者对新管线的测试中，相比早期的 SteamVR + ALVR 方案，部分游戏观察到最高约 10–20% 的 FPS 提升和约 20 ms 的延迟降低**；用户也报告了相近的数据（例如 Enshrouded：维护者这里约 45 FPS，而一位用户自行测得 SteamVR 下为 35–40 FPS）。这些只是已测配置下的观察结果，**不保证一定获得提升**：表现会因游戏、头显和网络而异，某些配置下两种方案表现相当。帧生成应单独评估：它在部分 GPU 瓶颈场景中能改善输出/显示帧节奏，但也有自身的延迟取舍。技术背景请参阅下文的性能发现和测试平台。
@@ -101,7 +105,7 @@ flowchart LR
         direction LR
         G["OpenXR 游戏<br/>(UEVR、原生 VR)"]
         V["VirtualDesktop-OpenXR<br/>OpenXR 运行时，少量补丁"]
-        S["OVRShim (LibOVRRT64_1.dll)<br/>合成图层，将游戏帧节奏限制为显示刷新率的 1/3、1/2 或 2/3，<br/>通过共享 GPU 内存传递 10 位帧环形缓冲区"]
+        S["OVRShim (LibOVRRT64_1.dll)<br/>合成图层，将游戏帧节奏限制为显示刷新率的 1/2 或 1/3，<br/>通过共享 GPU 内存传递 10 位帧环形缓冲区"]
         H["alvr_host.exe<br/>帧生成（RIFE 神经网络、<br/>NVIDIA Optical Flow）、头部姿态时间戳、<br/>注视点编码、NVENC HEVC 10 位分片编码、<br/>ALVR 20 服务器核心"]
         L["AirFrameXR.exe 启动器<br/>设置、游戏记录、<br/>建议、重新居中"]
         G --> V --> S --> H
@@ -123,11 +127,11 @@ flowchart LR
 
 <p align="center"><img src="docs/images/ui_launcher.png" width="520" alt="启动器：串流器、游戏统计、设置、高级视频与性能设置、诊断与头显设置，以及两个开关：AirFrameXR OpenXR 运行时和通过 OpenComposite 使用 OpenVR"></p>
 
-**串流器**。三个实时信息块显示游戏 FPS、头显显示状态和延迟；下方一行显示串流 FPS、码率和丢包数；接着是 **功能**：帧生成（x1.5、x2、x3 或自动）和可选桌面镜像的并排开关，以及伽马、锐化、眼睛高度和重新居中按钮。标题栏中的菜单（三条横线）可打开主菜单、游戏统计和高级设置。
+**串流器**。三个实时信息块显示游戏 FPS、头显显示状态和延迟；下方一行显示串流 FPS、码率和丢包数；接着是 **功能**：帧生成（x2、x3 或自动）和可选桌面镜像的并排开关，以及伽马、锐化、眼睛高度和重新居中按钮。标题栏中的菜单（三条横线）可打开主菜单、游戏统计和高级设置。
 
-<p align="center"><img src="docs/images/ui_streamer.png" width="640" alt="串流器窗口：三个实时信息块和一行数值；功能区域包含 x1.5 / x2 / x3 帧生成和桌面镜像，以及画面和位置设置"></p>
+<p align="center"><img src="docs/images/ui_streamer.png" width="640" alt="串流器窗口：三个实时信息块和一行数值；功能区域包含 x2 / x3 帧生成和桌面镜像，以及画面和位置设置"></p>
 
-**每款游戏的运行情况**。每款游戏各有一条记录。最近一次会话按从游戏（左）到头显（右）的顺序展示：FPS、帧生成、编码、网络和解码耗时、头显显示状态，以及拆分后的各部分延迟。还包括最近会话的趋势图（FPS、延迟、重复帧）、根据通用日志绘制的最近一次运行时间线（FPS、生成延迟、GPU 显存、帧到达提前量）、会话历史和日志导出。
+**每款游戏的运行情况**。每款游戏各有一条记录。最近一次会话按从游戏（左）到头显（右）的顺序展示：FPS、帧生成、编码、网络和解码耗时、头显显示状态，以及拆分后的各部分延迟。还包括最近会话的趋势图（FPS、延迟、重复帧）、根据通用日志绘制的最近一次运行时间线（FPS、GPU 显存、帧到达提前量）、会话历史和日志导出。
 
 <p align="center"><img src="docs/images/ui_performance.png" width="860" alt="游戏统计：以六个阶段展示游戏到头显的会话及延迟拆分、会话趋势图，以及来自日志的最近一次运行时间线"></p>
 
@@ -192,12 +196,11 @@ flowchart LR
 **已完成的测试**。在实验室设备（RTX 3080 Ti 笔记本）上，已针对已知存在和不存在故障的生成会话测试探针和报告、录制器文件处理，以及 100–200% 缩放下的 1080p、1440p 和 4K 窗口。与帧节奏实验室相比，探针自身在 1 Hz 下不可见，在 5 Hz 下使第 95 百分位数增加 0.25 ms。**尚未测试：真实头显会话中的录制**（在真实游戏中使用 F8、完整会话和深度跟踪）。请将最初的判定视为初步结果，并告诉我们你的观察。设计、测量和测试矩阵见 [docs/TELEMETRY_PLAN.md](docs/TELEMETRY_PLAN.md)、[docs/BENCH_UI.md](docs/BENCH_UI.md)。
 
 ## 功能
-- **设置向导**（`configure.exe`）：读取头显支持的能力，提供社区配置文件、预填的手动配置或现有 ALVR 设置，然后测试结果（系统和 NVENC、编码速度、配置码率下的网络、通过管线串流的真实场景及头显自身的头部姿态、音频）。
-  串流器窗口中的 **查找头显...** 会搜索网络并配对。任何支持 NVENC API 12.2+ 的 NVIDIA GPU 均可使用。
+- **设置向导**（`configure.exe`）：读取头显支持的能力，提供社区配置文件、预填的手动配置或现有 ALVR 设置，然后测试系统与 NVENC、编码速度、配置码率下的网络，以及真实场景串流（使用头显自身的头部姿态，先测试原始画面，再以 x2 帧生成运行 30 秒）和音频。如果神经网络合成无法在这台电脑上维持头显刷新率，向导会自动改用 edge。串流器窗口中的 **查找头显...** 会搜索网络并配对；任何支持 NVENC API 12.2+ 的 NVIDIA GPU 均可使用。
 - **帧节奏控制**：使用输入门控和深度为三的有序队列。Vision Pro 配置文件默认使用 300 Mbps 注视点编码。
-- **帧生成**（默认关闭，可在串流器和设置中切换，仍属实验性质）：用于无法维持显示刷新率的游戏。滑块将游戏帧率设为显示刷新率的**三分之一、二分之一（默认）或三分之二**，串流器负责生成中间帧。**自 1.4.2 起，中间帧由神经网络生成：**
-  [RIFE](https://github.com/hzwer/Practical-RIFE) 4.4 由自研 CUDA 引擎运行（`bin\neural`：CUTLASS 卷积和少量自研内核，针对该网络硬编码；由一个脚本从固定版本源码构建），逐对分析游戏帧之间画面各部分的运动和混合方式，处理分辨率为单眼分辨率的一半；之后串流器使用每张游戏帧的一个采样点，以完整分辨率绘制画面，保持静止内容精确，并让每张生成帧带有对应时刻的运动信息。此功能需要 RTX 30 系列或更新型号。后备方案可在高级视频与性能设置的 *生成帧合成* 中选择 **神经**或**边缘**；较旧 GPU 会单独使用该方案。这是 1.4.1 中的合成算法：使用 GPU 光流引擎（NVIDIA Optical Flow，Turing 或更新架构）估算场景内运动，再进行边缘感知合成（保持运动边缘清晰；运动不确定时显示真实帧，而不是叠加重影；思路源自 [VectorXR](https://github.com/DienerTech/vectorxr)，已重新实现；更早的算法仍作为**经典**选项保留）。两种算法都会先消除头部转动对运动估算的影响，也会测量并消除摇杆转向的影响，且每个输出帧都会旋转至最新的跟踪采样位置。在 RTX 5090 上搭配 Vision Pro 以 100 Hz 测试：半帧率运行时，错过的显示周期从 38% 降至 1%；也在 Quest 3 上运行过。
-  该算法必然增加延迟（插值需要一个游戏帧周期），而且按设计不会自动开启：如果游戏能稳定维持 70–75 FPS，通常最好不要启用。勾选 **推荐**后，会根据该游戏在已连接头显上的记录运行结果设置帧率；**重新居中**（按钮和快捷键，默认为 **End**；每次游戏启动时也会发送）可将跟踪空间转向你当前面对的方向。详见 [docs/FRAME_GENERATION.md](docs/FRAME_GENERATION.md)、[docs/NEURAL_RIFE_CUDA.md](docs/NEURAL_RIFE_CUDA.md)（神经网络引擎的构建和检查方式及测量结果）、[docs/FRAME_GENERATION_UNCAPPED.md](docs/FRAME_GENERATION_UNCAPPED.md)，以及 [docs/PERMANENT_RECORD.md](docs/PERMANENT_RECORD.md)（历史档案）中关于尝试并移除 DLSS 运动向量的说明。
+- **逐眼使用各自的姿态**（1.5.0）。OpenXR 为一帧中的每只眼睛提供独立姿态，串流器现在会遵循这些姿态：逐眼交替渲染的模组（例如 Luke Ross 模组或 NoMoreFlat）会按各自的实际渲染姿态显示每只眼睛；没有新画面的帧会保留该画面的时间戳。重复帧依据运行时自身记录识别（参见我们的 [VDXR 分支](docs/UPSTREAM.md)），而非根据头部姿态猜测，也不会丢弃帧。高级设置中的*最高 OpenXR 兼容模式*默认关闭；游戏若重复提交每张画面两次或三次，开启后即可按完整帧率运行。原理见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#frames-repeats-and-the-pose-each-eye-is-shown-at-150)，设计和测量见 [docs/PLAN_UNIVERSAL_OPENXR.md](docs/PLAN_UNIVERSAL_OPENXR.md)。
+- **NVIDIA Smooth Motion 警告**（1.5.0）。如果为 VR 游戏开启了 NVIDIA 平面游戏帧生成（NVIDIA App > Graphics > *Smooth Motion*），VR 模组可能出现卡顿和单眼延迟。游戏结束后，若检测到该功能正在运行，串流器会以红色提示并说明如何关闭。
+- **帧生成**（默认关闭，可在串流器和设置中切换，仍属实验性质）：适用于无法维持显示刷新率的游戏。倍率为 **x2**（默认，游戏以显示刷新率的一半运行）或 **x3**（三分之一），串流器会在网络最适合发送的固定时刻生成中间帧（[为何只有这两种倍率](docs/FRAME_GENERATION.md#rates-150-x2-and-x3)）。**自 1.4.2 起，中间帧由神经网络生成：**[RIFE](https://github.com/hzwer/Practical-RIFE) 4.4 由自研 CUDA 引擎运行（`bin\neural`：CUTLASS 卷积和少量自研内核，针对该网络硬编码；由一个脚本从固定版本源码构建），逐对分析游戏帧之间画面各部分的运动和混合方式，处理分辨率为单眼分辨率的一半；之后串流器以完整分辨率绘制画面，保持静止内容精确，并让每张生成帧带有对应时刻的运动信息。它需要 RTX 30 系列或更新型号及足够的 GPU 资源；Vision Pro 串流分辨率可能令中端 GPU 无法维持帧率，因此设置向导会进行实测，并在不达标时选择 edge（见 [1.5.0 说明](docs/releases/v1.5.0.md)）。高级视频与性能设置中的 *生成帧合成* 可选择 **neural** 或 **edge**；较旧 GPU 会自动单独使用 edge。edge 使用 GPU 光流引擎（NVIDIA Optical Flow，Turing 或更新架构）估算场景内运动，再进行边缘感知合成（保持运动边缘清晰；运动不确定时显示真实帧，而不是叠加重影；思路源自 [VectorXR](https://github.com/DienerTech/vectorxr)，已重新实现）。头部转动会在两种算法估算运动前消除，摇杆转向也会测量并消除；每个输出帧都会旋转至最新的跟踪采样位置。在 RTX 5090 上搭配 Vision Pro 以 100 Hz 测试：半帧率运行时，错过的显示周期从 38% 降至 1%；也在 Quest 3 上运行过。该算法必然增加延迟（插值需要一个游戏帧周期），而且按设计不会自动开启：如果游戏能稳定维持 70–75 FPS，通常最好不要启用。勾选 **推荐**后，会根据该游戏在已连接头显上的记录运行结果设置帧率；**重新居中**（按钮和快捷键，默认为 **End**；每次游戏启动时也会发送）可将跟踪空间转向你当前面对的方向。详见 [docs/FRAME_GENERATION.md](docs/FRAME_GENERATION.md)、[docs/NEURAL_RIFE_CUDA.md](docs/NEURAL_RIFE_CUDA.md)（神经网络引擎的构建和检查方式及测量结果），以及 [docs/PERMANENT_RECORD.md](docs/PERMANENT_RECORD.md)（历史档案）中关于尝试并移除 DLSS 运动向量的说明；已移除的 x1.5 和不封顶模式见 [docs/permanent_record/FRAME_GENERATION_UNCAPPED.md](docs/permanent_record/FRAME_GENERATION_UNCAPPED.md)。
 - **从串流器为游戏设置视野**：显示相对于游戏原本渲染内容节省的资源、可用于提升画质的百分比、在头显中进行的一分钟校准（每只眼睛四条线）；Vision Pro 还会根据 Apple 速率图和你的选择计算注视点区域。[工作原理](#how-fov-restriction-works)。
 - **各类窗口**（见上文）：启动器、串流器、日志与性能、带建议的诊断、设置向导、视野校准、防火墙检查和 OpenXR 图层检查。它们会适配显示器（从 1080p 笔记本到 4K，缩放 100–200%），并由下文的 UI 测试工具检查。
 - **桌面镜像**（可选）：见上文；左右手均可使用。
@@ -313,7 +316,7 @@ AirFrameXR 得以实现，离不开以下项目提供的基础和贡献：
 - **[ALVR](https://github.com/alvr-org/ALVR)**（MIT），由 polygraphene 和 alvr-org 贡献者开发：本项目依赖的基础设施、串流协议、服务器核心、网络、音频、注视点编码和 NVENC 编码器代码，以及运行在头显上的 [ALVR visionOS 客户端](https://github.com/alvr-org/alvr-visionos)。
   正是 ALVR 让无线 PC VR 得以开源。
 - **[VirtualDesktop-OpenXR (VDXR)](https://github.com/mbucchia/VirtualDesktop-OpenXR)**（MIT），由 Matthieu Bucchianeri 及其贡献者开发：出色且高度优化的 OpenXR 运行时，本项目中的所有游戏都运行于此；OVRShim 最初基于其 OVRNull 示例。也感谢同一作者开发了 VR 社区所依赖的许多其他 OpenXR 工具。
-- **[OFXR-Bridge](https://github.com/tig3rmast3r/OFXR-Bridge)**（LGPL-3.0），由 tig3rmast3r 开发：本项目研究了其帧生成合成方案（旋转补偿残差光流、中点采样、置信度计算和交叉淡化后备方案）以及永不阻塞的安全规则，并在此重新实现；它对应“经典”合成模式。
+- **[OFXR-Bridge](https://github.com/tig3rmast3r/OFXR-Bridge)**（LGPL-3.0），由 tig3rmast3r 开发：其思路曾影响帧生成器的早期设计。本项目研究并重新实现了它的合成方案，作为第一种“经典”合成方式（已于 1.5.0 移除，edge-aware 方案表现更好）；其永不阻塞的安全规则仍用于保护帧生成器。
 - **[VectorXR](https://github.com/DienerTech/vectorxr)**（MPL-2.0），由 DienerTech 开发：本项目研究了其边缘感知合成方案（向量中值、源帧求解光流、运动边缘处逐像素选择候选结果、不确定运动向真实帧收敛），并在此重新实现。
 - **[RIFE](https://github.com/hzwer/Practical-RIFE)**（MIT），由 hzwer（Zhewei Huang）及其合作者开发（论文“Real-Time Intermediate Flow Estimation for Video Frame Interpolation”，ECCV 2022）：神经网络帧生成所用的网络。RIFE 4.4 权重经过转换后随程序存放于 `bin\neural`；我们的 CUDA 引擎依据 **[vs-rife](https://github.com/HolyWu/vs-rife)**（MIT，由 HolyWu 开发）的模型代码实现，其发布页面提供权重文件。感谢你们让实时插帧技术开源。
 - **[OpenComposite](https://gitlab.com/znixian/OpenOVR)**（GPL-3.0-or-later），由 znixian 及其贡献者开发：OpenVR 到 OpenXR 的转译层，让旧版 OpenVR 游戏无需 SteamVR 即可运行于 AirFrameXR。项目预构建的 DLL 与源码和许可证一同原样放在 `opencomposite\` 中；它们是独立程序（没有链接进 AirFrameXR），仅当启动器的 OpenVR 开关开启时才会由游戏加载。
@@ -328,7 +331,7 @@ MIT，详见 [LICENSE](LICENSE)。第三方组件仍遵循各自的许可证（[
 ## 文档
 
 - **从这里开始：**[docs/INSTALL.md](docs/INSTALL.md)（安装、设置、日志、音频）、[docs/PERFORMANCE_KNOBS.md](docs/PERFORMANCE_KNOBS.md)（每个设置项及其调节依据）、[docs/EXPERIMENTAL_SWITCHES.md](docs/EXPERIMENTAL_SWITCHES.md)（高级视频与性能设置窗口）、[docs/HMD_PROFILES.md](docs/HMD_PROFILES.md)（社区配置文件）。
-- **工作原理：**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（帧管线、线程、缓冲区）、[docs/FRAME_GENERATION.md](docs/FRAME_GENERATION.md) 和 [docs/FRAME_GENERATION_UNCAPPED.md](docs/FRAME_GENERATION_UNCAPPED.md)、[docs/FRAME_GENERATION_JUDGE.md](docs/FRAME_GENERATION_JUDGE.md)、[docs/AVP_FOV.md](docs/AVP_FOV.md) 和 [docs/FOV_GRID.md](docs/FOV_GRID.md)（视野；[视野限制的工作原理](#how-fov-restriction-works)）、[docs/CHROMA_KEY_PROTOCOL.md](docs/CHROMA_KEY_PROTOCOL.md)、[docs/DESKTOP_MIRROR.md](docs/DESKTOP_MIRROR.md)、[docs/UI_SPEC.md](docs/UI_SPEC.md)、[docs/CONFIGURE_WIZARD.md](docs/CONFIGURE_WIZARD.md)、[docs/BENCHMARK_DESIGN.md](docs/BENCHMARK_DESIGN.md)。
+- **工作原理：**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（帧管线、线程、缓冲区）、[docs/FRAME_GENERATION.md](docs/FRAME_GENERATION.md)、[docs/FRAME_GENERATION_JUDGE.md](docs/FRAME_GENERATION_JUDGE.md)、[docs/AVP_FOV.md](docs/AVP_FOV.md) 和 [docs/FOV_GRID.md](docs/FOV_GRID.md)（视野；[视野限制的工作原理](#how-fov-restriction-works)）、[docs/CHROMA_KEY_PROTOCOL.md](docs/CHROMA_KEY_PROTOCOL.md)、[docs/DESKTOP_MIRROR.md](docs/DESKTOP_MIRROR.md)、[docs/UI_SPEC.md](docs/UI_SPEC.md)、[docs/CONFIGURE_WIZARD.md](docs/CONFIGURE_WIZARD.md)、[docs/BENCHMARK_DESIGN.md](docs/BENCHMARK_DESIGN.md)。已移除的不封顶模式与 x1.5 说明已归档于 [docs/permanent_record/FRAME_GENERATION_UNCAPPED.md](docs/permanent_record/FRAME_GENERATION_UNCAPPED.md)。
 - **经验总结：**[docs/PERFORMANCE_FINDINGS.md](docs/PERFORMANCE_FINDINGS.md)（已尝试过的方案，避免重复走弯路）。
 - **参与贡献：**[CONTRIBUTING.md](CONTRIBUTING.md)、[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)、[docs/DEVELOPMENT_PHILOSOPHY.md](docs/DEVELOPMENT_PHILOSOPHY.md)、[docs/UPSTREAM.md](docs/UPSTREAM.md)、[harness/README.md](harness/README.md)。
 - **状态和历史：**[docs/progress.md](docs/progress.md)、[docs/releases/](docs/releases/)。较早的计划和日志存档于 [docs/PERMANENT_RECORD.md](docs/PERMANENT_RECORD.md)（仅在需要回顾过去决策时查阅）。
