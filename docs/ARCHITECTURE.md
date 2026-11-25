@@ -22,34 +22,68 @@ VR stack does (SteamVR's running start, Meta's Phase Sync, the OpenXR `xrWaitFra
 | `calibrate.exe` + `bench\xr_probe.exe` | the field of view calibration: a window that starts the probe's tool scene (`XR_PROBE_TOOL=fit`), an ordinary OpenXR app on the PC streamed like a game. Not part of the engine either (see "Field of view in 1.4") |
 | `tray.exe` | the notification-area program: watches for the paired headset (`alvr_host --discover`, renewed when its one-hour process ends) and starts the streamer when it appears; idle while a streamer runs. Started at Windows sign-in by a per-user Run entry, switched in the launcher (below OpenComposite) or in the tray's own menu |
 
-Shim and host share one memory block (`ovrshim/ipc.h`, IPC v38): host → shim config (eye size, FoV, the game's restricted FoV and render quality; since v38 no render ceiling), poses, display ticks, compositor
-pacing, the ring-slot ownership mask; shim → host frame announcements (seqlock), heartbeat, haptics, diagnostics, the render size it told the app.
+Shim and host share one memory block (`ovrshim/ipc.h`, IPC v40): host → shim config (eye size, FoV, the game's restricted FoV and render quality; since v38 no render ceiling; the
+compatibility mode and, since v39, the lab's frame-identity arm), poses, display ticks, compositor pacing, the ring-slot ownership mask; shim → host frame announcements (seqlock),
+heartbeat, haptics, diagnostics, the render size it told the app, and since v40 the VR guard's findings.
 
 VDXR and the shim also talk past the libOVR API, inside the game process: the shim exports `ovrshim_Trace`, which VDXR's fork resolves and
 calls from the app's `xrWaitFrame` / `xrBeginFrame` / `xrEndFrame` with what libOVR cannot carry (kinds and arguments:
 `virtualdesktop-openxr/airframexr_trace.h` in the fork): when the app's frame really started, and per frame how many swapchain slices had
 an image released since the previous frame (none = the app resubmitted its last picture) and how many went through VDXR's copy into a
-second OVR swapchain (texture arrays, MSAA). Stock VDXR and libOVR games never call it. Since 1.3.11 it is diagnostic only: the debug
-log's `app frames (VDXR)` line every 900 submits (resubmits, discarded frames, slices released/copied/skipped,
-`xrWaitFrame` return → `xrEndFrame` and `xrBeginFrame` → `xrEndFrame` p50/p95); no behaviour depends on it. The fork also copies and commits a slice
+second OVR swapchain (texture arrays, MSAA). Stock VDXR and libOVR games never call it. Since 1.5.0 the shim decides with it which submits are
+repeats (next section); the debug log's `app frames (VDXR)` line every 900 submits reports it (resubmits, discarded frames, slices
+released/copied/skipped, `xrWaitFrame` return → `xrEndFrame` and `xrBeginFrame` → `xrEndFrame` p50/p95). The fork also copies and commits a slice
 that goes through that second swapchain only when the app released a new image since the last frame (upstream did it every `xrEndFrame`): a
 resubmitted frame costs no GPU copy, and an OVR commit always means a new picture. The shim also exports
 `ovrshim_Capabilities` (bit 0: it reads texture-array slices in place when a layer's flags carry `0x400000`, eye e's slice at bits 24 + 4 e);
 only the experiment on fork branch `airframexr-slices` sets that flag (`docs/PLAN_VDXR_FORK_LAB.md`). Every 2D swapchain image is composed
 through an array view, so a single-pass stereo swapchain (OpenXR `arraySize` 2) is read slice by slice.
 
+## Frames, repeats and the pose each eye is shown at (1.5.0)
+
+OpenXR gives each view of a frame its own pose and leaves it to the runtime to "map the view and FOV to the system display"; it has no notion
+of "the same picture again". The shim (`ovrshim/driver.cpp`, `SubmitFrame`) follows that, using the fork's per-frame facts:
+
+- **A repeat** is a submit whose projection slices released no new image since the previous frame. The head poses do not decide: OFXR's
+  generated frames carry the real frame's render poses, and a mod can draw a new picture under old poses. Without the facts (stock VDXR, a
+  libOVR game) no submit is a repeat.
+- **The timestamp** a frame leaves with is the tracking sample its picture was rendered with (pose matching, `FrameClientTimestamp`). A repeat
+  leaves with the previous frame's timestamp: the headset shows the same picture under the same pose instead of turning an old picture to a new pose.
+- **Each eye at its own pose.** When the projection layer's two eyes carry head orientations more than 1e-4 rad apart (alternate-eye rendering
+  mods submit one eye a frame older than the other), the frame is stamped with the newer eye's sample and the older eye is drawn rotated from
+  its own render orientation to the newer one (qRel = qSrc⁻¹·qOut in `EyeHomography`, inside the projection pass every eye already goes through
+  for the FoV change: no extra GPU work); quad layers follow. In a normal game both eyes share one orientation and the rotation is the identity.
+  ALVR v20 carries one pose per frame; for a rotation, mapping in the shim is equivalent and keeps every client working.
+- **Nothing is dropped**: every submit is composed and published.
+- **Maximum OpenXR compatibility mode** (`video.drop_duplicate_frames`, Advanced, off by default): when the repeats form a pattern (windows of 40
+  submits: 1-2 repeats per real picture, 40-70 % of the submits; two windows to start, one to stop), the waits that follow a real picture return
+  at once (a free wait: no boundary, one release token), so a client that submits each picture two or three times is paced once per picture.
+  Off is OpenXR's letter: `xrWaitFrame` "should block until the beginning of the next frame interval".
+- **Counters:** the debug log's `identity:` line (arm, re-stamped, without runtime facts, with several facts; eyes mapped by their own poses, with
+  the angle), the pacing line's `duplicate frames seen N dropped 0 (pacing fix on|off, K duplicates per real frame, free waits W)`, and at game
+  exit, in every flavour, `eyes mapped by their own poses in N submits`.
+- **Lab switch** `lab_identity` 0-3 (host `--lab-identity N` or stdin `lab_identity N`, harness `AIRFRAMEXR_LAB_IDENTITY`; IPC `labIdentity`; no
+  GUI, no config file): 0 = 1.5's rule (a repeat = the previous submit's exact poses), 1 = same poses and nothing released, 2 = nothing
+  released and the re-stamp, **3 = 2 and each eye at its own pose (the default)**. The design and the measurements: `docs/PLAN_UNIVERSAL_OPENXR.md`
+  (sections 6 and 6b); the frame-identity matrix: `harness/scenarios/identity`, `run.py identity`.
+
+**VR guard** (`VrGuardCheck`): once when the game creates its session (`SetSubmissionDevice`) and once at its first submit, the shim looks for
+NVIDIA Smooth Motion in the game's process (`NvPresent64.dll`, the driver's frame generation for flat games: it doubles a VR mod's submits and
+later presents from its own thread). A finding goes to the run log (WARN), to the IPC (`shim.vrGuard`, bit 0), to the host's `game_ended` event
+(`"vr_guard": ["smooth_motion"]`) and to the streamer's footer: a red line after the game, cleared by the next clean game. Nothing runs per frame.
+
 ## Threads (v0.2)
 
 | Stage | Thread | Clock / rule | Blocks on |
 |---|---|---|---|
 | Game render → VDXR async submission → shim `ovr_EndFrame` compose into a ring slot | VDXR submission thread | the game's own loop | `PickSlot()`: never a slot the host holds, one still on the GPU, or the last published |
-| Shim `ovr_WaitToBeginFrame` (**running start**) | VDXR submission thread | release = next host boundary − app frame-time envelope − `running_start_ms` (2 ms); one release per boundary; a game slower than a period free-runs. The game's `xrWaitFrame` waits for this release (VDXR patch 5, 2026-10-23: VDXR's own running start woke the app a period earlier) | the boundary grid (host ticks); GPU throttle ≤ 1 frame in flight |
+| Shim `ovr_WaitToBeginFrame` (**running start**) | VDXR submission thread | release = next host boundary − app frame-time envelope − `running_start_ms` (2 ms); one release per boundary; a game slower than a period free-runs. The game's `xrWaitFrame` waits for this release (VDXR patch 5, 2026-10-23: VDXR's own running start woke the app a period earlier). With the compatibility mode acting, the waits after a real picture return at once (free waits, see "Frames, repeats and the pose each eye is shown at") | the boundary grid (host ticks); GPU throttle ≤ 1 frame in flight |
 | Shim GPU-complete wait → IPC publish | shim publisher thread (time-critical) | DXGI completion event per slot | the GPU |
 | Shim display clock (predicted display time to the game) | shim server thread (time-critical) | host vsync event | the host tick |
 | **Host clock**: display ticks to the shim, **compositor boundary** pick (newest complete frame → encoder mailbox; green idle frame at 30 fps with no game; empty boundary left empty) | host vsync thread (HIGHEST, sleep-then-spin) | ALVR's `duration_until_next_vsync` grid at the headset's refresh | nothing (one-deep mailboxes, newest wins) |
 | **Field of view**: the headset's FoV (ViewsConfig) is the stream frame's and the composition target's; the game is told a per-edge restricted FoV and a recommended size reduced with its area (shim `GetEyeFov` / `GetRecommendedResolution`, host `fovScale`, taken at the app's start). 1.4: our Vision Pro app declares the box the host sent it (`video.client_box`, Reserved message), so the restriction scales nothing and the game's frame is the stream's | shim, host | the FOV card's profile | nothing |
 | **Host intake**: IPC frame event → frame queue (three deep, oldest first), slot marked busy for the shim | host intake thread (HIGHEST) | the shim's publish event | nothing |
-| **Host encoder**: foveation pass + NVENC on the picked slot (slot released when its copy is done), packets → sender queue | host encoder thread (HIGHEST) | encoder mailbox | the encode itself only; the main loop rebuilds the encoder under the same lock, only when no game runs |
+| **Host encoder**: foveation pass + NVENC on the picked slot (slot released when its copy is done), packets → sender queue; with frame generation on, the generator's passes first (see "Frame generation") | host encoder thread (HIGHEST) | encoder mailbox | the encode itself only; the main loop rebuilds the encoder under the same lock, only when no game runs |
 | **Host sender**: release each packet at its send time `asap` \| `vsync` (next tick) \| `phase` (boundary + encode-time envelope, default) → `send_video_nal` | host sender thread (HIGHEST) | sender queue | nothing |
 | Network send (shards over UDP/TCP) | ALVR sender thread (`server_core`) | | socket |
 | Tracking receive → head/hand poses into the IPC block (seqlock), PLL residual statistics | ALVR receive thread → host event thread | the headset's one sample per display frame | nothing |
@@ -83,17 +117,38 @@ the one SteamVR's compositor runs with, so the encoder's copy never queues behin
   A frame superseded before a boundary (`superseded`) means the game ran faster than the display; an encoder overrun means an
   encode took longer than a period.
 
-- **Phase lock** (`tools/host/src/phase.rs`): from the headset's own reports of how long a decoded frame waited for its render tick, it slides the host's display grid in steps of at most 2 ms, no more than one per two evaluations, until the earliest arrivals sit about 7 ms before the tick; the game's release, the pick, the encode and the send all follow that grid. It needs about 4.5 s to settle at a game's start, which is why a pacing check must not judge a run shorter than that (`e2e_baseline` measures the drift from 0.5 s after the last correction and runs 900 frames).
+- **Phase lock** (`tools/host/src/phase.rs`): from the headset's own reports of how long a decoded frame waited for its render tick, it slides the host's display grid in steps of at most 2 ms, no more than one per two evaluations, until the earliest arrivals sit about 7 ms before the tick; the game's release, the pick, the encode and the send all follow that grid. Measured 2026-11-24: it does not settle. In the lab (the mock client without its display model reports no wait) and in the field's debug logs (Vision Pro, estimates 0-5 ms against the 7 ms target) it corrects every 2-3 s for whole sessions; an open question (`docs/progress.md`, Known open).
 
-## Frame generation and its neural engine (1.4.2)
+## Frame generation (1.5.0: x2 / x3, neural or edge)
 
-Frame generation (`nvenc/hostlib/framegen.cpp`, docs/FRAME_GENERATION.md) runs on the **host encoder thread**, on the encoder's D3D11 device
-and immediate context: no thread of its own, no extra copy of the stream frame on the way to NVENC. Per rendered frame the encoder thread
-copies the slot into a short history, turns the older frame of the pair into the newer frame's camera (the head's rotation and the measured
-camera turn removed) and runs NVIDIA Optical Flow on the pair (the driver's `nvofapi64.dll`). Per output boundary it draws the picture
-(mode 0 = a real frame re-rotated, mode 1 = a generated one at time t) and encodes it.
+For a game that cannot hold the headset's refresh rate (docs/FRAME_GENERATION.md). Two fixed regimes and two ways to draw the frames in
+between, nothing adaptive: a regime that follows the game's jitter amplifies its hitches, and the network places the picture right only at
+fixed moments (docs/NEURAL_RIFE_CUDA.md "Output time"). The 2/3 rate and the uncapped mode (a content clock asking for any moment) and the
+classic / edge-blend syntheses were removed in 1.5.0.
 
-**The neural fields** (synthesis `neural`, the default since 1.4.2; `nvenc/hostlib/neural.cpp`, `nvenc/rife/`, docs/NEURAL_RIFE_CUDA.md):
+**Pacing (shim + host).** The rate (`video.frame_gen_rate`: `half` = x2, `third` = x3) sets the IPC's `appPeriodMul` = m: the shim releases
+the game every m-th compositor boundary, so its frames come one game period (m display periods) apart and each is rendered for the boundary
+it will be shown at. The user's game fps lock (`appMinPeriodUs`, `video.frame_gen_cap_fps`) applies on top, in every mode. The host's encoder
+thread keeps a fixed pattern per game period (`pipeline.rs` `FgState`): rendered frame B arrives, A being the previous one, and the
+boundaries get S(A, B, 1/m), ..., S(A, B, (m-1)/m), then B itself. A frame C that arrives while any of these is still due waits in the intake
+(the clock thread does not pick it), so the schedule never shifts and every rendered frame is shown in order; if the encoder fell a boundary
+behind, the late B is dropped and C's pattern starts at once (the motion stays continuous). A boundary with nothing due waits up to 4 ms
+for the expected frame (`fg_wait_arrival`), else re-sends B rotated to the new head sample. Every output is stamped with a tracking sample
+newer than the last sent frame, one sample kept in hand, and rotated to it (head turns stay at the display rate); no such sample: the
+boundary is skipped and what it owed stays owed. A frame without a projection layer (a loading screen, a menu of quads) goes out as is and
+the generator's history restarts. The streamer's x2 / x3 buttons change the rate live (stdin `frame_gen_rate`: the pattern and
+`appPeriodMul` change together, the game record starts a new segment).
+
+**The generator** (`nvenc/hostlib/framegen.cpp`) runs on the **host encoder thread**, on the encoder's D3D11 device and immediate context:
+no thread of its own, no extra copy of the stream frame on the way to NVENC. Per rendered frame it copies the slot into a short history
+(4 frames), turns the older frame of the pair into the newer frame's camera (the head's rotation and the measured camera turn removed) and
+runs NVIDIA Optical Flow on the pair (the driver's `nvofapi64.dll`; the camera turn measures from it and the edge synthesis draws from it).
+Per output boundary it draws the picture (mode 0 = a real frame re-rotated, mode 1 = a generated one at time t = k/m) and encodes it.
+Two syntheses (`video.frame_gen_synthesis`): **neural** (default, below) and **edge**, the fallback: the optical flow's vectors with a
+3 x 3 median, the vector solved where the content comes from, a per-pixel choice at motion boundaries, doubtful motion shrinking toward the
+real frame (ideas studied in VectorXR, re-implemented).
+
+**The neural fields** (synthesis `neural`, the default since 1.4.2; `nvenc/hostlib/neural.cpp`, `nvenc/rife/`, docs/NEURAL_RIFE_CUDA.md), per network run:
 
 | Step | Where | What |
 |---|---|---|
@@ -103,10 +158,9 @@ camera turn removed) and runs NVIDIA Optical Flow on the pair (the driver's `nvo
 | unmap | CUDA | orders the D3D11 output pass after the network |
 | output | the edge synthesis's pixel shader (`neuralSynth`) | one sample of each original frame through the fields and the rotation chain, the older frame outside the newer view, still content kept exact |
 
-The fields belong to one output time: run once per pair when the outputs keep one time (the 1/2 rate), else once per output (1.5x, 3x).
-The optical flow keeps running (the camera turn measures from it, the fallback draws from it). The fallback, the edge synthesis from the
-optical flow, draws every output when the user picks `edge`, when the network's files are missing, on a GPU before compute capability 8.0
-(RTX 30) or after a failure (logged in debug mode). The network enqueues in a fraction of a millisecond of the encoder thread's CPU and
+The fields belong to one output time: x2, one network run per game frame at t = 1/2 (run as soon as the pair exists); x3, one per output,
+at 1/3 and 2/3. The edge synthesis draws every output when the user picks `edge`, when the network's files are missing, on a GPU before
+compute capability 8.0 (RTX 30) or after a failure (logged in debug mode). The network enqueues in a fraction of a millisecond of the encoder thread's CPU and
 costs GPU time on the shader cores the game also uses (docs/NEURAL_RIFE_CUDA.md "Checks"); its buffers are allocated once.
 
 ## Field of view in 1.4

@@ -47,7 +47,7 @@ namespace AirFrameXR
             add("Clean network bitrate", r.CleanMbps > 0 ? $"{r.CleanMbps:0} Mbps" : "-", $"{tg.MinMbps:0} Mbps minimum, {tg.GoodMbps:0}+ comfortable ({ew}x{eh} at {ctxFps:0} Hz, HEVC)", Reference.Bitrate(r.CleanMbps, tg),
                 $"The link carries less than the stream needs ({tg.MinMbps:0} Mbps): {prof.WifiAdvice}.");
             add("Packets lost per second", r.LossPerS >= 0 && r.CleanMbps > 0 ? $"{r.LossPerS:0.00}" : "-", "0 is clean; up to 1 is tolerable", Reference.Loss(r.CleanMbps > 0 ? r.LossPerS : -1), $"The wireless link drops packets: {prof.WifiAdvice}.");
-            add("Total latency (ALVR's own)", r.TotalMs > 0 ? $"{r.TotalMs:0.0} ms" : "-", $"under {tg.LatencyGoodMs:0} ms good, {tg.LatencyOkMs:0} ms acceptable", Reference.Latency(r.TotalMs, tg));
+            add("Total latency (measured by the streamer)",r.TotalMs > 0 ? $"{r.TotalMs:0.0} ms" : "-", $"under {tg.LatencyGoodMs:0} ms good, {tg.LatencyOkMs:0} ms acceptable", Reference.Latency(r.TotalMs, tg));
             add("   network", r.NetworkMs > 0 ? $"{r.NetworkMs:0.0} ms" : "-", $"about {tg.NetworkGoodMs:0} ms", Reference.Network(r.NetworkMs, tg));
             add("   headset decoder", r.DecodeMs > 0 ? $"{r.DecodeMs:0.0} ms" : "-", $"5-{tg.DecodeGoodMs:0} ms at high bitrates", Reference.Decode(r.DecodeMs, tg));
             add("   encoder (ALVR's view)", r.EncoderMs > 0 ? $"{r.EncoderMs:0.0} ms" : "-", "", Rating.Unknown);
@@ -57,6 +57,18 @@ namespace AirFrameXR
             {
                 add("Head tracking (scene test)", $"{r.HeadSamplesPerS:0}/s, gaps up to {r.HeadGapP95Ms:0} ms, turned {r.HeadYawRangeDeg:0} deg", $"about {ctxFps:0} samples per second, no long gaps; the scene saw your movement", r.HeadSamplesPerS >= 0.8 * ctxFps && (r.HeadYawRangeDeg >= 5 || r.HeadMoveCm >= 3) ? Rating.Good : Rating.Ok);
                 add("Repeated head samples", $"{r.SameTsPct:0.#}% of frames", "a frame sharing the previous frame's head sample is not shown as a new picture; a few percent is normal", r.SameTsPct < 5 ? Rating.Good : r.SameTsPct < 15 ? Rating.Ok : Rating.Poor);
+            }
+            if (r.FgRan)
+            {
+                // the scene test's last 30 seconds with frame generation x2: neural keeps its place only if the stream holds the rate (the wizard writes edge otherwise)
+                var synth = r.FgSynthesis == "neural" ? $"neural, {r.FgNeuralMs:0.0} ms a run" : r.FgSynthesis == "" ? "synthesis unknown" : r.FgSynthesis;
+                add("Frame generation x2 (scene test)", $"{r.FgStreamFps:0} of {ctxFps:0} fps streamed, game {r.FgAppFps:0} fps ({synth})", "95% of the refresh rate or more",
+                    r.FgHolds ? Rating.Good : Rating.Poor,
+                    r.FgSynthesis == "neural"
+                        ? "The neural synthesis is too slow on this PC at this resolution: the configuration uses edge (Advanced, Frame generation, to change it). A lower resolution or refresh rate leaves it more room."
+                        : "Frame generation does not hold the refresh rate at this resolution: lower the resolution or the refresh rate for games that need it.");
+                if (r.FgTotalMs > 0 && r.TotalMs > 0)
+                    add("   latency with frame generation", $"{r.FgTotalMs:0.0} ms ({r.FgTotalMs - r.TotalMs:+0.0;-0.0} ms against off)", $"under {tg.LatencyGoodMs:0} ms good, {tg.LatencyOkMs:0} ms acceptable", Reference.Latency(r.FgTotalMs, tg));
             }
             add("Video codec", hs.Enc10 ? "HEVC 10-bit" : "HEVC 8-bit", prof.CodecAdvice, hs.Enc10 || !prof.Tuned ? Rating.Good : Rating.Ok);
             // OpenXR API layers that load into every game: some capture the controllers before any runtime sees them

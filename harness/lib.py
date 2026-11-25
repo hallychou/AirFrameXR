@@ -560,6 +560,8 @@ def run_scenario(sc, outdir: Path, log=print):
                 feedpre = f"powershell -NoProfile -ExecutionPolicy Bypass -File {rd}\\feed.ps1 | "
                 steps["stdin_feed_events"] = len(feed)
             lab_knob = ' --drop-duplicate-frames' if os.environ.get('AIRFRAMEXR_LAB_DROP_DUP') and 'drop_duplicate_frames' not in h else ''   # AIRFRAMEXR_LAB_DROP_DUP=1: the game frame pacing fix ON in every scenario (a scenario that sets the key itself keeps its value)
+            if os.environ.get('AIRFRAMEXR_LAB_IDENTITY') and 'lab_identity' not in h:   # the frame-identity arm (0 / 1 / 2, docs/PLAN_UNIVERSAL_OPENXR.md Phase B) in every scenario
+                lab_knob += f" --lab-identity {int(os.environ['AIRFRAMEXR_LAB_IDENTITY'])}"
             hostcmd = (envpre + feedpre + f'{host_exe} --config-dir {rd}\\host_cfg --session {rd}\\session.json {src_arg}{dump_arg}'
                        f'--report {rd}\\host_report.json --frames-csv {rd}\\host_frames.csv ' + ('' if 'idle_rgb' in h else '--idle-rgb 00ff00 ') + lab_knob.lstrip()+' '
                        + argline(h, {"fps": "--fps", "seconds": "--seconds", "min_frames": "--min-frames", "live": "--live", "shim": "--shim", "daemon": "--daemon", "gui": "--gui", "split_encode": "--split-encode", "gpu_keepalive": "--gpu-keepalive",
@@ -569,7 +571,7 @@ def run_scenario(sc, outdir: Path, log=print):
                                      "connect_timeout": "--connect-timeout", "exit_after_frames": "--exit-after-frames",
                                      "running_start_ms": "--running-start-ms",
                                      "head_wait_ms": "--head-wait-ms", "predict_missing_head": "--predict-missing-head", "head_in_order": "--head-in-order",
-                                     "frame_gen": "--frame-gen", "frame_gen_rate": "--frame-gen-rate", "frame_gen_cap": "--frame-gen-cap", "drop_duplicate_frames": "--drop-duplicate-frames", "frame_gen_t": "--frame-gen-t", "client_box": "--client-box", "fov_quality": "--fov-quality", "mask_fill": "--mask-fill"})
+                                     "frame_gen": "--frame-gen", "frame_gen_rate": "--frame-gen-rate", "frame_gen_cap": "--frame-gen-cap", "drop_duplicate_frames": "--drop-duplicate-frames", "lab_identity": "--lab-identity", "frame_gen_t": "--frame-gen-t", "client_box": "--client-box", "fov_quality": "--fov-quality", "mask_fill": "--mask-fill"})
                        + (f' 2>&1 | findstr "^" > {rd}\\host_stdout.txt' if h.get("stdout_pipe") else f' > {rd}\\host_stdout.txt 2>&1'))   # stdout_pipe: through a reader that a fault can freeze (the GUI reads it like that)
             if topo.get("host_launch") == "interactive":
                 log("  starting host (builder, interactive session, limited)")
@@ -1612,25 +1614,25 @@ def analyse_pacing(sc, outdir, period_ms):
     lat = [(int(c[1]) - int(c[0])) / 1e6 for c in crows[first + warm:last + 1]]
     third = max(1, len(lat) // 3)
     drift = round(pct(lat[-third:], .5) - pct(lat[:third], .5), 2) if len(lat) >= 30 else None
-    # The first seconds of a game are not a steady state: the frames alternate between two latencies one frame period apart (the app's frame is picked from the
-    # slot before or after) until the host's phase lock has slid the boundary clock (docs/ARCHITECTURE.md; two corrections of 2 ms, the last about 3.5 s into the game).
-    # Once it has settled the latency is one value, higher than the mean of the alternation, which the thirds above read as a creep of up to a period. So the drift that
-    # decides the check is measured from 0.5 s after the last correction of the phase lock (a queue that only grows still shows there); the whole-run figure is kept.
-    drift_all, settle_s = drift, None
+    # The latency against the pose timestamp is not a queue measure in the lab: it flips between two values about one display period apart,
+    # for seconds at a time, in passing and failing runs alike (2026-11-24, 3080 Ti: per-second medians 25 / 35 ms), with the host's phase
+    # lock on or off (A/B, 3 pairs each of e2e_openxr_probe and e2e_baseline). What flips is the tracking sample a frame is stamped with,
+    # not its transit; the cause is not established. The thirds then differ by up to a period in either direction (saved runs: -8 to +9.6 ms,
+    # the old check failed 55 of 197). A queue sits after the host's boundary pick (encoder, network, client): the drift that decides the
+    # check is measured on that transit, the host's boundary to the client's arrival, paired by the frame's timestamp (same PC: one constant
+    # clock offset, removed by the difference). Saved runs: -2.0 to +1.4 ms (132 with host_pipeline.csv; a synthetic queue growing 12 ms
+    # over the run reads 7.0 ms). The latency against the pose timestamp stays in the report (latency_drift_pose_ms).
+    drift_pose, transit = drift, None
     try:
-        hs_ = [json.loads(l) for l in open(outdir / "host_stdout.txt", errors="replace") if '"phase_lock"' in l or '"game_started"' in l]
-        t_game = next((e["t_ms"] for e in hs_ if e["event"] == "game_started"), None)
-        acted = [e["t_ms"] for e in hs_ if e["event"] == "phase_lock" and (e.get("data") or {}).get("acted")]
-        _, prow2 = read_csv(outdir / "host_pipeline.csv")
-        send_of = {int(r[1]): float(r[7]) for r in prow2 if int(r[0]) >= 0}
-        t0_send = min(send_of.values())
-        if t_game is not None and acted:
-            settle_s = (max(acted) - t_game) / 1000.0 + 0.5
-            late_lat = [(int(c[1]) - int(c[0])) / 1e6 for c in crows[first + warm:last + 1] if int(c[0]) in send_of and send_of[int(c[0])] - t0_send >= settle_s]
-            if len(late_lat) >= 90:
-                th = max(1, len(late_lat) // 3)
-                drift = round(pct(late_lat[-th:], .5) - pct(late_lat[:th], .5), 2)
-    except (OSError, ValueError, KeyError, StopIteration):
+        hdr_, prow2 = read_csv(outdir / "host_pipeline.csv")    # frame,ts_ns,slot,t_boundary,...
+        ib = hdr_.index("t_boundary")
+        bnd = {int(r[1]): float(r[ib]) for r in prow2 if int(r[0]) >= 0}
+        tr = [int(c[1]) / 1e6 - bnd[int(c[0])] * 1000.0 for c in crows[first + warm:last + 1] if int(c[0]) in bnd]
+        if len(tr) >= 90:
+            th = max(1, len(tr) // 3)
+            transit = round(pct(tr[-th:], .5) - pct(tr[:th], .5), 2)
+            drift = transit
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
         pass
     # where the skipped slots are made: the same count on the host's own send times means the slot was already empty when the host picked a frame for it (the app or the stage before
     # the encoder had nothing ready); more at the client means the network or the client added them
@@ -1644,7 +1646,7 @@ def analyse_pacing(sc, outdir, period_ms):
         pass
     return {"period_ms": period_ms, "n": len(d), "p50": round(pct(d, .5), 2), "p95": round(pct(d, .95), 2), "p99": round(pct(d, .99), 2),
             "max": round(max(d), 2), "max_gap_periods": round(max(d) / period_ms, 2), "late": sum(late), "late_frac": round(sum(late) / len(d), 4),
-            "longest_late_run": best, "latency_drift_ms": drift, "latency_drift_whole_run_ms": drift_all, "phase_settle_s": settle_s, "late_frac_at_host_send": host_late}
+            "longest_late_run": best, "latency_drift_ms": drift, "latency_drift_transit_ms": transit, "latency_drift_pose_ms": drift_pose, "late_frac_at_host_send": host_late}
 
 
 def analyse_display(sc, outdir, client, period_ms):
@@ -2080,12 +2082,24 @@ def analyse(sc, outdir: Path):
         a["handover_chain"] = analyse_handover_chain(sc, outdir)
     if sc.get("checks", {}).get("tool"):
         a["tool"] = analyse_tool(sc, outdir)
+    if "vr_guard" in sc.get("checks", {}):   # the last game_ended event's VR guard findings (host stdout)
+        a["vr_guard"] = None
+        for line in open(outdir / "host_stdout.txt", errors="replace"):
+            if '"event":"game_ended"' in line.replace(" ", ""):
+                try:
+                    a["vr_guard"] = (json.loads(line[line.index("{"):]).get("data") or {}).get("vr_guard", [])
+                except Exception:
+                    pass
     if sc.get("checks", {}).get("fov_restrict"):
         a["fov_restrict"] = analyse_fov_restrict(sc, outdir)
     if sc.get("checks", {}).get("qpmap"):
         a["qpmap"] = analyse_qpmap(sc, outdir, a.get("host") or {})
     if sc.get("checks", {}).get("modsim") and sc.get("app"):
         a["modsim"] = analyse_modsim(sc, outdir)
+    if sc.get("checks", {}).get("identity") and sc.get("app"):
+        a["identity"] = analyse_identity(sc, outdir)
+        if (sc["checks"]["identity"] or {}).get("stamp") is not None:
+            a["identity_stamp"] = analyse_stamp_truth(sc, outdir)
     if sc.get("checks", {}).get("pacing") and sc.get("app"):
         a["pacing"] = analyse_pacing(sc, outdir, 1000.0 / ((a.get("host") or {}).get("fps_target") or 90.0))
     period = 1000.0 / ((a.get("host") or {}).get("fps_target") or 90.0)
@@ -2233,6 +2247,164 @@ def analyse_modsim(sc, outdir):
             res["shim"] = {"releases": int(last.group(1)), "late": int(last.group(2)), "dups_seen": int(last.group(3)), "dups_dropped": int(last.group(4)),
                            "fix": last.group(5), "dup_per_real": int(last.group(6)), "free_waits": int(last.group(7))}
     return res
+
+def analyse_identity(sc, outdir):
+    """The frame-identity matrix (docs/PLAN_UNIVERSAL_OPENXR.md): what each submit really was, from the app (xr_modsim's CSV END rows: rel = images
+    released since the previous submit, new_pic = a picture never submitted before, same_pose = the previous submit's exact poses), against what
+    VDXR reports (the shim's `app frames (VDXR)` line: frames whose swapchains released nothing) and what the shim dropped (pacing line).
+    Classes: a true duplicate = same poses and a repeated picture (safe to drop); OFXR-like = same poses, new picture (must be kept);
+    re-released = an image released whose picture repeats (a release-based identity calls it new). The comparisons use the app's first N submits,
+    N = the frames of the VDXR line (both lines come from the same 900-frame block), or the whole run without that line.
+    None when the CSV has no truth columns (an xr_modsim older than the identity matrix)."""
+    f = Path(outdir) / "modsim.csv"
+    if not f.exists():
+        return None
+    ends, waits = [], []
+    for line in f.read_text(errors="replace").splitlines()[1:]:
+        q = line.split(",")
+        if len(q) >= 8 and q[2] == "END":
+            try:   # the 9th column (eyes: projection eye images released) came with the late shapes; older CSVs have none
+                ends.append((float(q[0]) / 1000.0, int(q[5]), int(q[6]), int(q[7]), int(q[8]) if len(q) >= 9 else -1))
+            except ValueError:
+                pass
+        elif len(q) >= 3 and q[2] == "WAIT_OUT":
+            try:
+                waits.append(float(q[0]) / 1000.0)
+            except ValueError:
+                pass
+    if not ends or ends[0][1] < 0:
+        return None
+
+    def classes(rows):
+        c = {"submits": len(rows), "no_release": 0, "repeat_pic": 0, "same_pose": 0, "true_dup": 0, "same_pose_new_pic": 0, "re_released": 0,
+             "stale_pose": 0, "one_eye": 0}
+        for _, rel, newp, same, eyes in rows:
+            c["no_release"] += rel == 0
+            c["repeat_pic"] += newp == 0
+            c["same_pose"] += same == 1
+            c["true_dup"] += same == 1 and newp == 0
+            c["same_pose_new_pic"] += same == 1 and newp == 1
+            c["re_released"] += rel > 0 and newp == 0
+            c["stale_pose"] += rel == 0 and same == 0   # the old picture under a new pose (Black Flag after its change, plan 5b)
+            c["one_eye"] += eyes == 1                    # one eye's picture new, the other's from the frame before
+        return c
+    res = {"all": classes(ends)}
+    V = analyse_vdxr_trace(outdir)
+    n = V["frames"] if V else len(ends)
+    res["window"] = classes(ends[:n])
+    res["window_from"] = "vdxr line" if V else "whole run (no VDXR line)"
+    if V:
+        res["vdxr"] = {"frames": V["frames"], "resubmits": V["resubmits"]}
+    sl = Path(outdir) / "ovrshim.log"
+    if sl.exists():
+        last = None
+        for line in sl.read_text(errors="replace").splitlines():
+            m = re.search(r"duplicate frames seen (\d+) dropped (\d+) \(pacing fix (on|off), (\d+) duplicates per real frame, free waits (\d+)\)", line)
+            if m:
+                last = m
+        if last:
+            res["shim"] = {"dups_seen": int(last.group(1)), "dups_dropped": int(last.group(2)), "fix": last.group(3), "free_waits": int(last.group(5))}
+        idl = None
+        for line in sl.read_text(errors="replace").splitlines():
+            m = re.search(r"identity: arm (\d+), submits (\d+), same poses with an image released (\d+), new poses with nothing released (\d+), "
+                          r"re-stamped (\d+), without runtime facts (\d+), with several (\d+)", line)
+            if m:
+                idl = m
+        if idl:   # the frame-identity arm in force and its cumulative counters (Phase B; absent before IPC 39)
+            res["shim_identity"] = dict(zip(("arm", "submits", "same_pose_released", "stale_pose", "restamped", "no_facts", "multi_facts"), map(int, idl.groups())))
+    # the app's wait rate: steady part, and inside MODSIM_PAUSE_S when set (a paused app must stay paced, not spin)
+    t0 = ends[0][0]
+    def rate(a, b):
+        k = [w for w in waits if a <= w < b]
+        return round(len(k) / (b - a), 1) if b > a else None
+    res["wait_rate_hz"] = rate(t0 + 3.0, ends[-1][0] - 1.0)
+    ps = str(sc.get("app", {}).get("env", {}).get("MODSIM_PAUSE_S", ""))
+    if ":" in ps:
+        lo, hi = (float(x) for x in ps.split(":", 1))
+        # the app's pause clock starts at its loop start (about the first submit); keep 1 s off both edges
+        res["pause_wait_rate_hz"] = rate(t0 + lo + 1.0, t0 + hi - 1.0)
+        res["pause"] = classes([e for e in ends if t0 + lo + 1.0 <= e[0] < t0 + hi - 1.0])
+    return res
+
+
+def analyse_stamp_truth(sc, outdir):
+    """Does each picture reach the client under the pose it was rendered with? (docs/PLAN_UNIVERSAL_OPENXR.md 5b: the shaking.) The client
+    reprojects a frame from the pose of its timestamp, so a picture shown under another pose moves by the difference: the stamping error.
+    Per received frame: the picture's id decoded from its 16 stamp blocks (left eye), the yaw xr_modsim rendered that picture with (its DRAW
+    rows), and the yaw the mock client sent for the frame's timestamp (frames.csv `yaw`, else `yaw_near`). A constant offset between the
+    app's and the client's yaw is removed (the median, from the frames before MODSIM_CHANGE_AT when there are enough). A frame is a mismatch
+    when |error - offset| > checks.identity.stamp.max_rad (default 0.002 rad: one frame of the rows' head motion is about 0.009). Pictures
+    with an id below the CHANGE row's are "before" (the control), from it on and the extra pictures (ids from 40000) "after". The frames of
+    the stream's first checks.identity.stamp.warmup_s (default 2 s, from the first decoded one) are left out: the ALVR server turns the
+    tracking space once when the client's PlayspaceSync arrives (server_core connection.rs, rotation_recentering_mode Yaw), so the
+    pictures that reach the client before it carry another offset (2026-11-23 Phase B arm 0: 25 frames 0 mrad, then 174 mrad for the
+    whole run; whether any picture beats it is a race). None without the inputs (an xr_modsim without DRAW rows, no recorded stream)."""
+    import csv
+    outdir = Path(outdir)
+    f, cl, fc = outdir / "modsim.csv", outdir / "client.hevc", outdir / "frames.csv"
+    if not (f.exists() and fc.exists() and cl.exists() and cl.stat().st_size > 0):
+        return None
+    draws, change_id, extra = {}, None, set()
+    for line in f.read_text(errors="replace").splitlines()[1:]:
+        q = line.split(",")
+        try:
+            if len(q) >= 5 and q[2] == "DRAW":
+                draws[int(q[3]) & 0xFFFF] = int(q[4]) / 1e6   # the stamp holds 16 bits (OFXR's generated ids are id + 100000)
+                if 40000 <= int(q[3]) < 60000:
+                    extra.add(int(q[3]))   # MODSIM_SAMEPOSE_NEW's own pictures: new, under the previous poses (must reach the client)
+            elif len(q) >= 5 and q[2] == "CHANGE" and change_id is None:
+                change_id = int(q[4])
+        except ValueError:
+            pass
+    if not draws:
+        return None
+    scfg = ((sc.get("checks", {}).get("identity") or {}).get("stamp") or {})
+    thr, warm_ns = scfg.get("max_rad", 0.002), int(1e9 * scfg.get("warmup_s", 2.0))
+    cfg = negotiated_cfg(outdir)
+    vals, _ = read_stamps_at(cl, stamp_points(cfg, 64, bool(cfg.get("enable_foveated_encoding"))))
+    rows = list(csv.DictReader(open(fc)))
+    shift = len(rows) - len(vals)   # frames the decoder could not output are at the start
+    errs, unknown, no_yaw, warm, t0 = [], 0, 0, 0, None
+    for i, v in enumerate(vals):
+        ci = i + shift
+        if not 0 <= ci < len(rows) or v in (0, 65535):   # green / idle frames read all-ones, an empty first frame reads 0
+            continue
+        try:
+            ts = int(rows[ci].get("ts_ns") or 0)
+        except ValueError:
+            ts = 0
+        t0 = ts if t0 is None else t0
+        if ts and ts - t0 < warm_ns:   # before the server's PlayspaceSync recenter (see above)
+            warm += 1
+            continue
+        y = rows[ci].get("yaw") or rows[ci].get("yaw_near")
+        if not y:
+            no_yaw += 1
+            continue
+        if v not in draws:
+            unknown += 1
+            continue
+        late = v >= 40000 or (change_id is not None and v >= change_id)
+        errs.append((late, draws[v] - float(y)))
+    shown = {v for v in vals if v in extra}   # the extra pictures any received frame showed (a dropped one never reaches the client)
+    if not errs:
+        return {"frames": 0, "unknown_ids": unknown, "no_client_yaw": no_yaw, "decoded": len(vals), "received": len(rows),
+                "warmup_skipped": warm, "extra_drawn": len(extra), "extra_shown": len(shown)}
+    base = [e for late, e in errs if not late]
+    ref = base if len(base) >= 20 else [e for _, e in errs]
+    off = sorted(ref)[len(ref) // 2]
+
+    def part(sel):
+        r = sorted(abs(e - off) for late, e in errs if late == sel)
+        if not r:
+            return {"frames": 0}
+        mis = sum(1 for x in r if x > thr)
+        return {"frames": len(r), "mismatches": mis, "share": round(mis / len(r), 4), "p50_mrad": round(1000 * r[len(r) // 2], 2),
+                "p95_mrad": round(1000 * r[int(0.95 * (len(r) - 1))], 2), "max_mrad": round(1000 * r[-1], 2)}
+    return {"frames": len(errs), "decoded": len(vals), "received": len(rows), "unknown_ids": unknown, "no_client_yaw": no_yaw,
+            "warmup_skipped": warm, "offset_rad": round(off, 5), "threshold_rad": thr, "change_id": change_id, "before": part(False), "after": part(True),
+            "extra_drawn": len(extra), "extra_shown": len(shown)}
+
 
 def evaluate(sc, a):
     """Returns list of checks: {name, ok, value, expected}."""
@@ -2551,7 +2723,13 @@ def evaluate(sc, a):
             chk("height_calibrated_eye_height", abs(hc.get("eye_height_m", -9) - want["eye_height_m"]) <= want.get("tol", 0.02), hc.get("eye_height_m"), f"{want['eye_height_m']} +- {want.get('tol', 0.02)}")
             chk("height_calibrated_headset_y", abs(hc.get("headset_y", -9) - want["headset_y"]) <= want.get("tol", 0.02), hc.get("headset_y"), f"{want['headset_y']} +- {want.get('tol', 0.02)}")
     if "fg" in ck:   # frame generation: the generator ran clean, generated its share, held the display rate, and what it cost (analyse_fg)
-        want, f = ck["fg"], a.get("fg") or {}
+        want, f = dict(ck["fg"]), a.get("fg") or {}
+        rig_fg = None
+        for rig in (jload(ROOT / "harness" / "rigs.json") or {}).get("rigs", []):   # a slower GPU's own frame generation baseline, per scenario (harness/rigs.json)
+            if a.get("rig") and rig["match"].lower() in a["rig"].lower() and sc.get("name") in (rig.get("fg") or {}):
+                rig_fg = rig["name"]
+                want.update(rig["fg"][sc["name"]])
+        on_rig = f" ({rig_fg}'s baseline, harness/rigs.json)" if rig_fg else ""
         chk("fg_reported", bool(f) and not f.get("error"), f.get("error") or f.get("steady_windows"), "fg_perf windows with outputs (the host's frame generation statistics)")
         if f and not f.get("error"):
             chk("fg_cost", True, {k: f.get(k) for k in ("frame", "flow_size", "flow_ms_avg", "synth_ms_avg", "gpu_ms_per_s", "synth_ms_per_mpx", "flow_ms_per_mpx", "app_fps_p50", "stream_fps_p50")},
@@ -2569,7 +2747,10 @@ def evaluate(sc, a):
                 chk("fg_synth_share", lo <= f.get("synth_share", -1) <= hi, f.get("synth_share"), f"[{lo}, {hi}] of the outputs generated (the rest the newest real frame)")
             if "min_stream_fps_frac" in want:
                 chk("fg_holds_display_rate", f.get("stream_fps_frac", 0) >= want["min_stream_fps_frac"], f.get("stream_fps_p50"),
-                    f">= {want['min_stream_fps_frac']} x the display rate (median of the steady windows; min {f.get('stream_fps_min')})")
+                    f">= {want['min_stream_fps_frac']} x the display rate (median of the steady windows; min {f.get('stream_fps_min')}){on_rig}")
+            if "max_neural_ms" in want:   # the neural run's GPU time (a rig's baseline: a slower network or a slower path fails)
+                nm = (f.get("neural") or {}).get("gpu_ms_avg") or 0
+                chk("fg_neural_ms", 0 < nm <= want["max_neural_ms"], nm, f"(0, {want['max_neural_ms']}] ms per neural run{on_rig}")
             for k, label in (("max_flow_ms", "flow_ms_avg"), ("max_synth_ms", "synth_ms_avg"), ("max_gpu_ms_per_s", "gpu_ms_per_s")):
                 if k in want:
                     chk(f"fg_{label}", 0 < f.get(label, 0) <= want[k], f.get(label), f"(0, {want[k]}]")
@@ -2632,7 +2813,10 @@ def evaluate(sc, a):
             if "max_late_run" in pc:
                 chk("pacing_no_hitch", pk["longest_late_run"] <= pc["max_late_run"], pk["longest_late_run"], f"at most {pc['max_late_run']} late frames in a row (three in a row is a visible hitch)")
             if "max_drift_ms" in pc and pk.get("latency_drift_ms") is not None:
-                chk("pacing_latency_steady", abs(pk["latency_drift_ms"]) <= pc["max_drift_ms"], pk["latency_drift_ms"], f"the pipeline latency of the last third of the run is within {pc['max_drift_ms']} ms of the first third's (a queue that only grows)")
+                on_transit = pk.get("latency_drift_transit_ms") is not None
+                chk("pacing_latency_steady", abs(pk["latency_drift_ms"]) <= pc["max_drift_ms"], {"drift_ms": pk["latency_drift_ms"], "measured_on": "transit" if on_transit else "pose", "pose_drift_ms": pk.get("latency_drift_pose_ms")},
+                    f"the pipeline latency of the last third of the run is within {pc['max_drift_ms']} ms of the first third's (a queue that only grows), measured on the host-to-client transit "
+                    "(the host's boundary pick to the client's arrival); the latency against the pose timestamp (pose_drift_ms) is information: in the lab it flips by a display period")
             if pk.get("late_frac_at_host_send") is not None:
                 chk("pacing_late_attribution", True, {"late_frac_at_client": pk["late_frac"], "late_frac_at_host_send": pk["late_frac_at_host_send"]}, "information: the skipped slots counted at the host's send (made before the encoder: the app or the pick had no frame) and at the client (the same = none added by the network or the client)")
         pj = (h or {}).get("pacing") or {}
@@ -2744,6 +2928,9 @@ def evaluate(sc, a):
         chk("killed_game_logs", len(shim) >= 1 and "game exit" not in runs and "game ended: xr_probe.exe" in il.get("general", "") + runs,
             {"shim_lines": len(shim), "shim_game_exit": "game exit" in runs, "game_ended": "game ended: xr_probe.exe" in il.get("general", "") + runs},
             "the run log holds the shim's lines from before the kill, no 'game exit' (it never ran), and the host's 'game ended' line")
+    if "vr_guard" in ck:   # the VR guard (shim VrGuardCheck): the game_ended event lists exactly the findings expected ([] = quiet)
+        found = a.get("vr_guard")
+        chk("vr_guard", found is not None and sorted(found) == sorted(ck["vr_guard"]), found, f"game_ended vr_guard == {ck['vr_guard']}")
     if ck.get("alvr_in_unified_log"):
         # 1.3.10: ALVR's own lines are in AirFrameXR.log as [alvr]; the raw stream (alvr.log) exists only in the debug session folder
         il = a.get("install_logs") or {}
@@ -2796,14 +2983,20 @@ def evaluate(sc, a):
             chk("fix_on_idle_nothing_dropped", sh is not None and sh["fix"] == "on" and sh["dups_dropped"] == 0 and sh["free_waits"] == 0 and sh["dup_per_real"] == 0, sh, "knob ON, no duplicate pattern (stationary pose): nothing dropped, no free wait")
         if "expect_dup_per_real_at_end" in mk:
             chk("shim_dup_per_real_at_end", sh is not None and sh["dup_per_real"] == mk["expect_dup_per_real_at_end"], sh and sh["dup_per_real"], f"the shim ends with {mk['expect_dup_per_real_at_end']} duplicates per real frame")
-        if "min_drop_ratio" in mk:
-            chk("fix_on_drop_ratio", sh is not None and sh["dups_seen"] > 0 and sh["dups_dropped"] >= mk["min_drop_ratio"] * sh["dups_seen"], sh, f">= {mk['min_drop_ratio']} of the duplicates seen are dropped")
+        if "min_drop_ratio" in mk:   # legacy key (the mode dropped repeats until 2026-11-24): now nothing may be dropped
+            chk("fix_on_nothing_dropped", sh is not None and sh["dups_seen"] > 0 and sh["dups_dropped"] == 0, sh, "repeats are seen and none is dropped (the mode only frees waits)")
         if "min_free_per_release" in mk:
             chk("fix_on_free_per_release", sh is not None and sh["free_waits"] >= mk["min_free_per_release"] * max(sh["releases"], 1), sh, f"free waits >= {mk['min_free_per_release']} x paced releases")
+        if mk.get("expect_nothing_dropped"):
+            chk("fix_on_nothing_dropped", sh is not None and sh["dups_seen"] > 0 and sh["dups_dropped"] == 0, sh, "repeats are seen and none is dropped (the mode only frees waits)")
+        if mk.get("fix") == "on_untouched":   # knob ON, a client whose every submit releases an image (OFXR's generated pictures): by the runtime's facts no repeat, the mode stays out
+            chk("fix_on_untouched", sh is not None and sh["fix"] == "on" and sh["dups_dropped"] == 0 and sh["free_waits"] == 0, sh, "knob ON, every submit released an image: nothing dropped, no free wait (as with the knob off)")
+            wr = (M.get("wait_after_real") or {}).get("p50_ms")
+            chk("fix_on_second_wait_paced", wr is not None and wr >= mk.get("min_second_wait_ms", 1.0), wr, f"second wait still blocks (>= {mk.get('min_second_wait_ms', 1.0)} ms p50), as with the knob off")
         if mk.get("fix") == "on_nodup":
             chk("fix_on_normal_game_untouched", sh is not None and sh["fix"] == "on" and sh["dups_dropped"] == 0 and sh["free_waits"] == 0, sh, "knob ON with a game that does not resubmit: nothing dropped, no free wait (the fix does not act)")
         if mk.get("fix") == "on" and generic:
-            chk("fix_on_dups_dropped", sh is not None and sh["fix"] == "on" and sh["dups_seen"] > 0 and sh["dups_dropped"] >= 0.95 * sh["dups_seen"], sh, "knob on: >= 95 % of the duplicates seen are dropped")
+            chk("fix_on_nothing_dropped", sh is not None and sh["fix"] == "on" and sh["dups_seen"] > 0 and sh["dups_dropped"] == 0, sh, "knob on: the repeats are seen and every one is published (the mode only frees waits, since 2026-11-24)")
             chk("fix_on_free_waits", sh is not None and sh["free_waits"] >= mk.get("min_free_wait_ratio", 0.8) * max(sh["releases"], 1), sh, f"knob on: free waits >= {mk.get('min_free_wait_ratio', 0.8)} x paced releases")
             wr = (M.get("wait_after_real") or {}).get("p50_ms")
             chk("fix_on_second_wait_free", wr is not None and wr <= mk.get("max_second_wait_ms", 1.0), wr, f"second wait returns at once (<= {mk.get('max_second_wait_ms', 1.0)} ms p50)")
@@ -2823,6 +3016,52 @@ def evaluate(sc, a):
                 part = M.get(nm)
                 if part:
                     chk("modsim_spacing_" + nm, part["stdev"] <= mk["max_spacing_stdev_ms"], part["stdev"], f"real-frame spacing stdev <= {mk['max_spacing_stdev_ms']} ms")
+    if ck.get("identity") and "identity" in a:
+        I = a["identity"]; ik = ck["identity"]
+        chk("identity_truth_present", I is not None and I["all"]["submits"] >= ik.get("min_submits", 300), I and I["all"]["submits"],
+            f">= {ik.get('min_submits', 300)} submits with the app's truth columns (xr_modsim with the identity matrix)")
+        if I is not None:
+            W = I["window"]; w = max(W["submits"], 1)
+            for key, (lo, hi) in ik.get("shape", {}).items():   # the run produced the shape it is named after: fraction of submits per class
+                v = round(W.get(key, 0) / w, 3)
+                chk(f"identity_shape.{key}", lo <= v <= hi, v, f"{lo} <= {key} / submits <= {hi}")
+            if ik.get("signal", True):   # H1a: VDXR's "released nothing" equals the app's truth, frame for frame in count
+                Vx = I.get("vdxr")
+                tol = max(ik.get("signal_tol", 3), 0.005 * w)
+                chk("identity_signal_matches_app", Vx is not None and abs(Vx["resubmits"] - W["no_release"]) <= tol,
+                    Vx and {"vdxr_resubmits": Vx["resubmits"], "app_no_release": W["no_release"], "frames": Vx["frames"]},
+                    f"VDXR's frames with no image released == the app's submits with no release (+- {tol:.0f}) over the same {w} frames")
+            S = I.get("shim")
+            if "max_dropped_new_pictures_frac" in ik:   # never drop a new picture: dropped share of same-pose submits <= their true-duplicate share
+                allowed = (W["true_dup"] / max(W["same_pose"], 1)) + ik["max_dropped_new_pictures_frac"]
+                v = round(S["dups_dropped"] / max(S["dups_seen"], 1), 3) if S is not None else None
+                chk("identity_no_new_picture_dropped", S is not None and (S["dups_dropped"] == 0 or v <= allowed), S and {"seen": S["dups_seen"], "dropped": S["dups_dropped"], "true_dup_share": round(W["true_dup"] / max(W["same_pose"], 1), 3)},
+                    f"dropped / seen <= true duplicates / same-pose submits + {ik['max_dropped_new_pictures_frac']} (a same-pose submit with a new picture is kept)")
+            if "min_true_dups_freed_frac" in ik:   # the compatibility mode (since 2026-11-24): every true duplicate published, the wait before it freed
+                share = W["true_dup"] / max(W["same_pose"], 1)
+                ok = S is not None and S["dups_seen"] > 0 and S["dups_dropped"] == 0 and S["free_waits"] >= ik["min_true_dups_freed_frac"] * share * S["dups_seen"]
+                chk("identity_true_dups_freed", ok, S and {"seen": S["dups_seen"], "dropped": S["dups_dropped"], "free_waits": S["free_waits"], "true_dup_share": round(share, 3)},
+                    f"nothing dropped, free waits >= {ik['min_true_dups_freed_frac']} x the true duplicates among the same-pose submits")
+            if "max_wait_rate_hz" in ik:   # no spin: the app's xrWaitFrame returns stay at the display rate (inside the pause when there is one)
+                v = I.get("pause_wait_rate_hz", I.get("wait_rate_hz"))
+                chk("identity_waits_paced", v is not None and v <= ik["max_wait_rate_hz"], v, f"<= {ik['max_wait_rate_hz']} xrWaitFrame returns per second"
+                    + (" inside the pause" if "pause_wait_rate_hz" in I else ""))
+            if "max_free_waits" in ik:
+                chk("identity_free_waits", S is not None and S["free_waits"] <= ik["max_free_waits"], S and S["free_waits"], f"<= {ik['max_free_waits']} free waits")
+            if ik.get("stamp") is not None:   # plan 5b: each picture reaches the client under the pose it was rendered with
+                st, sk = a.get("identity_stamp") or {}, ik["stamp"]
+                b, af = st.get("before") or {}, st.get("after") or {}
+                chk("identity_stamp_decoded", st.get("frames", 0) >= sk.get("min_frames", 300), st and {k: st.get(k) for k in ("frames", "decoded", "received", "unknown_ids", "no_client_yaw")},
+                    f">= {sk.get('min_frames', 300)} received frames with a decoded picture id and the client's yaw for their timestamp")
+                chk("identity_stamp_clean_before_change", b.get("frames", 0) > 0 and b.get("share", 1) <= sk.get("max_before_share", 0.005), b,
+                    f"before the late shapes: <= {sk.get('max_before_share', 0.005)} of the frames show a picture under another pose (> {st.get('threshold_rad', 0.002)} rad)")
+                if "max_after_share" in sk:   # rows whose shape no arm can fix (one eye released) leave it out: the numbers are in the analysis
+                    chk("identity_stamp_matches_picture", af.get("frames", 0) > 0 and af.get("share", 1) <= sk["max_after_share"], af,
+                        f"after the late shapes: <= {sk['max_after_share']} of the frames show a picture under another pose")
+                if "min_extra_shown_frac" in sk:   # exact where identity_no_new_picture_dropped is aggregate: each new same-pose picture by its id
+                    dr, sh = st.get("extra_drawn", 0), st.get("extra_shown", 0)
+                    chk("identity_new_pictures_shown", dr > 0 and sh >= sk["min_extra_shown_frac"] * dr, {"drawn": dr, "reached_client": sh},
+                        f">= {sk['min_extra_shown_frac']} of the new pictures drawn under the previous poses reach the client (decoded ids)")
     if "shim_submit_mode" in ck and h and h.get("shim"):
         chk("shim_submit_mode", h["shim"].get("submit_mode") == ck["shim_submit_mode"], h["shim"].get("submit_mode"), ck["shim_submit_mode"])
     if "gray_patch" in ck:

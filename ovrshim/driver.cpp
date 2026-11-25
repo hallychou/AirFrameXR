@@ -369,12 +369,22 @@ extern "C" __declspec(dllexport) uint32_t __cdecl ovrshim_Capabilities() {
 // (xrWaitFrame returned, xrBeginFrame) and whether a submit holds a newly released picture or resubmits the last one.
 // The AirFrameXR fork of VDXR (virtualdesktop-openxr/airframexr_trace.h, deps.lock.json) resolves ovrshim_Trace from this
 // DLL and calls it from the app's xrWaitFrame / xrBeginFrame / xrEndFrame; stock VDXR and libOVR games never call it.
-// Diagnostic only for now: counted and printed with the pacing lines, no behaviour depends on it. Times are OVR seconds.
+// Counted and printed with the pacing lines; the frame-identity lab arms (ipc labIdentity 1 / 2, SubmitFrame) also decide with the facts
+// taken since the previous submit; arm 0 (the default) decides nothing with them. Times are OVR seconds.
 namespace vdxrinfo {
     enum Kind : int { WaitFrameReturn = 1, BeginFrame = 2, EndFrame = 4, FrameContent = 8, FrameCopies = 9 };
     struct Stats {
         uint64_t calls{0}, frames{0}, resubmits{0}, slices{0}, released{0}, copied{0}, unchanged{0}, discarded{0};
         std::vector<float> waitToEndMs, beginToEndMs; // since the last pacing line
+    };
+    // FrameContent facts since the shim's previous submit, paired with the next submit by arrival order: the fork sends them before the
+    // frame goes to its submit (on the app thread, or before the layers go to its async submission thread), and ovr_EndFrame does not
+    // pass the frame index on to the driver. count != 1 at a submit is counted (identity line): 0 = no facts (stock VDXR, a libOVR game,
+    // a layer VDXR rejected), 2+ = the async thread fell a frame behind.
+    struct Facts {
+        uint32_t count{0};
+        double released{0.0};
+        long long lastId{-1};
     };
     struct Frame {
         long long id{-1};
@@ -382,7 +392,15 @@ namespace vdxrinfo {
     };
     static std::mutex g_mutex;
     static Stats g_stats;
+    static Facts g_facts;
     static Frame g_frames[8]; // frames in flight by id (an app may wait for frame N+1 before it ends N)
+
+    static Facts TakeFacts() {
+        std::lock_guard lock(g_mutex);
+        const Facts f = g_facts;
+        g_facts = Facts{};
+        return f;
+    }
 
     static Frame& Slot(long long id) {
         Frame& f = g_frames[(unsigned long long)id % 8];
@@ -423,6 +441,9 @@ extern "C" __declspec(dllexport) void __cdecl ovrshim_Trace(int kind, long long 
         g_stats.resubmits += (a == 0.0 && b > 0.0) ? 1 : 0;
         g_stats.released += (uint64_t)a;
         g_stats.slices += (uint64_t)b;
+        g_facts.count++;
+        g_facts.released += a;
+        g_facts.lastId = frameId;
         break;
     case FrameCopies: // a = slices copied into a second OVR swapchain (array slice > 0, MSAA), b = copies skipped (unchanged)
         g_stats.copied += (uint64_t)a;
@@ -524,7 +545,9 @@ namespace {
                 // the flag is shared by every app of the session: an app that was told to leave (the desktop mirror, when a game starts) must not clear it
                 // for the app that took over (that one wrote its own name into appExe)
                 if (_wcsicmp(m_ipc.state->shim.appExe, shimlog::ExeName().c_str()) == 0) m_ipc.state->shim.shimAlive = 0;
-                shimlog::General("INFO", "game exit: %llu frames", (unsigned long long)m_framesSubmitted);
+                shimlog::General("INFO", "game exit: %llu frames; eyes mapped by their own poses in %llu submits (right eye newer %llu, angle mean %.3f max %.3f deg)",
+                                 (unsigned long long)m_framesSubmitted, (unsigned long long)m_eyeMapSubmits, (unsigned long long)m_eyeMapRightRef,
+                                 m_eyeMapSubmits ? m_eyeMapAngleSum / (double)m_eyeMapSubmits * 57.29578 : 0.0, m_eyeMapAngleMax * 57.29578);
             }
             airframexr_ipc::CloseIpc(m_ipc);
 
@@ -534,6 +557,7 @@ namespace {
         void SetSubmissionDevice(ID3D11Device* device) override {
             TraceLocalActivity(local);
             TraceLoggingWriteStart(local, "HostDriver_SetSubmissionDevice", TLPArg(device, "Device"));
+            VrGuardCheck("session");
 
             if (!m_submissionDevice) {
                 m_submissionDevice = device;
@@ -949,7 +973,7 @@ namespace {
             if (frameIndex <= m_lastWaitedFrame) {
                 m_waitRepeatedIndex++;
             }
-            // Game frame pacing fix (ipc dropDuplicateFrames): an app that waits again for every duplicate it submits (a VR mod: wait / begin /
+            // Maximum OpenXR compatibility mode (ipc dropDuplicateFrames): an app that waits again for every repeat it submits (a VR mod: wait / begin /
             // end for the frame, then a second wait / begin / end that only resubmits it) waits right after a real submit for that second
             // time (probe of 2026-10-28: 0 ms after a real submit, 10-15 ms after a duplicate). Those waits pace nothing: each returns at once,
             // takes no boundary and no release, so the real frame's wait is the only one paced (one step per real frame, and the fps lock counts
@@ -965,7 +989,7 @@ namespace {
                     m_lastWaitedFrame = std::max(m_lastWaitedFrame, frameIndex);
                 }
                 {
-                    std::lock_guard rq(m_releaseQueueMutex); // the dropped duplicate takes one release token (SubmitFrame), so this wait gives one
+                    std::lock_guard rq(m_releaseQueueMutex); // the repeat's submit takes one release token when it is published, so this wait gives one
                     m_releaseQueue.push_back(QpcSeconds());
                     while (m_releaseQueue.size() > 4) {
                         m_releaseQueue.pop_front();
@@ -1056,7 +1080,7 @@ namespace {
                     // for the same queue.
                     const bool gateOn = m_ipc.state->host.intakeGate != 0 && m_ipc.state->host.clientConnected != 0;
                     bool wasGated = false;
-                    // fps cap (ipc appMinPeriodUs, uncapped frame generation): the release never comes sooner than the cap's period after the last one
+                    // the game fps lock (ipc appMinPeriodUs): the release never comes sooner than the lock's period after the last one
                     const double minPeriod = (double)(*(volatile uint32_t*)&m_ipc.state->host.appMinPeriodUs) * 1e-6;
                     const double capRelease = minPeriod > 0 ? m_lastReleaseS.load() + minPeriod : 0.0;
                     if (capRelease > 0) {
@@ -1251,7 +1275,8 @@ namespace {
 
         // Output-eye NDC -> homogeneous source-eye NDC for the projection-layer pass (ReprojectVS/PS, which divide per pixel):
         // the FoV change and the rotation qRel = qSrc^-1 * qOut from the output orientation to the one the layer was rendered
-        // with (identity today: frames leave with the pose they were rendered with; the parked re-stamp branch rotates here). Returned in the cbuffer's memory layout (column-major float4x4 for mul(v, M)).
+        // with (identity in a normal game; arm 3 rotates an eye rendered with another head orientation to the frame's, m_eyeMap). Returned in the
+        // cbuffer's memory layout (column-major float4x4 for mul(v, M)).
         static DirectX::XMFLOAT4X4 EyeHomography(const ovrFovPort& outFov, const ovrFovPort& srcFov, const OVR::Quatf& qRel) {
             // [x y 1] -> view direction in the output eye (OVR: -Z forward, +Y up, NDC y up)
             const double A[3][3] = {{(outFov.LeftTan + outFov.RightTan) / 2.0, 0, (outFov.RightTan - outFov.LeftTan) / 2.0},
@@ -1321,6 +1346,11 @@ namespace {
                     const auto* l = (const ovrLayerEyeFov*)h;
                     eyeView[0] = l->RenderPose[0];
                     eyeView[1] = l->RenderPose[1];
+                    if (m_eyeMap.on) {   // arm 3: world-locked layers line up with the eye as it is drawn
+                        for (int e = 0; e < ovrEye_Count; e++) {
+                            eyeView[e].Orientation = m_eyeMap.target[e];
+                        }
+                    }
                     haveProjection = true;
                     break;
                 }
@@ -1366,7 +1396,11 @@ namespace {
                             if ((eye == 0 && skipLeft) || (eye == 1 && skipRight)) {
                                 continue;
                             }
-                            constants.reprojectionMatrix = EyeHomography(m_eyeFov[eye], eyeFov->Fov[eye], OVR::Quatf()); // FoV change only
+                            // FoV change only; arm 3 (m_eyeMap): also the rotation from the eye's render orientation to the one it is drawn for
+                            const OVR::Quatf src = ((const void*)eyeFov == m_eyeMap.layer) ? m_eyeMap.src[eye]
+                                                                                            : OVR::Quatf(eyeFov->RenderPose[eye].Orientation);
+                            const OVR::Quatf qRel = m_eyeMap.on ? src.Inverted() * m_eyeMap.target[eye] : OVR::Quatf();
+                            constants.reprojectionMatrix = EyeHomography(m_eyeFov[eye], eyeFov->Fov[eye], qRel);
 
                             // OVR allows specifying null texture for the right eye.
                             const auto swapchain = eye == 0 || !eyeFov->ColorTexture[eye] ? eyeFov->ColorTexture[0]
@@ -1556,16 +1590,30 @@ namespace {
             }
             LogLayersIfChanged(layers);
 
-            // Game frame pacing fix (ipc dropDuplicateFrames, docs/EXPERIMENTAL_SWITCHES.md): a frame with exactly the render poses of the one
-            // before carries no new picture (a VR mod resubmits its last frame for the next display slot: probe of 2026-10-27, every frame
-            // twice). Off: nothing here runs unless debug logging is on, and then it only counts. On: once a duplicate PATTERN is confirmed
-            // (over windows of 40 submits, two in a row to start, one to stop: 1 or 2 duplicates per real frame, i.e. 40-70 % of the submits)
-            // the duplicates are neither composed nor published (their release tokens are taken so the queue stays in step). A client whose
-            // poses never change (every submit "the same") is not that pattern and is left alone; a duplicate is also published when no frame
-            // was for 250 ms.
+            // Maximum OpenXR compatibility mode (ipc dropDuplicateFrames, docs/EXPERIMENTAL_SWITCHES.md; off by default: OpenXR's letter, every
+            // wait paced). A submit that released no new image (the runtime's per-frame facts, arm >= 2) repeats the previous picture: an app that
+            // resubmits its last picture for the next display slot (a VR mod that submits from the game's Present). On: once that PATTERN is
+            // confirmed (windows of 40 submits, two in a row to start, one to stop: 1 or 2 repeats per real picture, i.e. 40-70 % of the submits),
+            // the waits that follow a real picture return at once (free waits, WaitForVsync), so the app is paced once per picture. OpenXR says
+            // the runtime "should block" every xrWaitFrame, hence a switch. Nothing is dropped (since 2026-11-24): every submit is composed and
+            // published, a repeat leaving with its own picture's timestamp (arm 2). Off: nothing here acts; with debug logging it only counts.
+            // Frame-identity lab arm (ipc labIdentity, docs/PLAN_UNIVERSAL_OPENXR.md Phase B): the runtime's facts since the previous submit
+            // (taken in every arm so none pile up; arm 0 decides nothing with them).
+            const uint32_t idArmRaw = m_ipc.state ? *(volatile uint32_t*)&m_ipc.state->host.labIdentity : 0u;
+            const uint32_t idArm = idArmRaw > 3u ? 3u : idArmRaw;
+            const vdxrinfo::Facts facts = vdxrinfo::TakeFacts();
+            if (!m_vrGuardSubmitChecked) {
+                m_vrGuardSubmitChecked = true;
+                VrGuardCheck("first frame");
+            }
+            const bool haveFacts = facts.count > 0;
+            const bool nothingReleased = haveFacts && facts.released == 0.0;
+            m_idSubmits++;
+            m_idNoFacts += haveFacts ? 0 : 1;
+            m_idMultiFacts += facts.count > 1 ? 1 : 0;
             if (m_ipc.state) {
                 const bool dropOn = *(volatile uint32_t*)&m_ipc.state->host.dropDuplicateFrames != 0;
-                if (dropOn || shimlog::DebugActive()) {
+                if (dropOn || shimlog::DebugActive() || idArm > 0) {
                     const ovrLayerEyeFov* proj = nullptr;
                     for (const ovrLayerHeader* h : layers) {
                         if (h && (h->Type == ovrLayerType_EyeFov || h->Type == ovrLayerType_EyeFovDepth)) {
@@ -1577,7 +1625,17 @@ namespace {
                         m_dupPoseValid = false;
                         m_freeBudget.store(0, std::memory_order_relaxed);
                     } else {
-                        const bool same = m_dupPoseValid && memcmp(proj->RenderPose, m_dupLastPose, sizeof(m_dupLastPose)) == 0;
+                        const bool samePose = m_dupPoseValid && memcmp(proj->RenderPose, m_dupLastPose, sizeof(m_dupLastPose)) == 0;
+                        if (samePose && haveFacts && !nothingReleased) {
+                            m_idSamePoseReleased++;   // a new picture under the previous poses (OFXR, a quad redrawn): arm 0 calls it a duplicate
+                        }
+                        if (m_dupPoseValid && !samePose && nothingReleased) {
+                            m_idStalePose++;          // the last picture under new poses
+                        }
+                        // the repeat decision: arm 0 = poses only (1.5, for the lab's A/B); arm 1 = same poses and nothing released; arms 2-3 = nothing
+                        // released, whatever the poses. Without the runtime's facts (stock VDXR, a libOVR game) arms 1-3 call no submit a repeat: no
+                        // evidence, no compatibility behaviour (Decision B).
+                        const bool same = idArm == 0 ? samePose : !haveFacts ? false : idArm == 1 ? (samePose && nothingReleased) : nothingReleased;
                         memcpy(m_dupLastPose, proj->RenderPose, sizeof(m_dupLastPose));
                         m_dupPoseValid = true;
                         if (same) {
@@ -1601,14 +1659,6 @@ namespace {
                             }
                             m_dupWinTotal = m_dupWinSeen = 0;
                         }
-                        const double nowS = QpcSeconds();
-                        if (same && dropOn && m_dupPerReal.load(std::memory_order_relaxed) > 0 && nowS - m_dupLastPassS < 0.25) {
-                            m_dupDropped++;
-                            (void)TakeFrameRelease();
-                            TraceLoggingWriteStop(local, "HostDriver_SubmitFrame");
-                            return true;
-                        }
-                        m_dupLastPassS = nowS;
                     }
                 }
             }
@@ -1617,7 +1667,20 @@ namespace {
             // frame's the headset skips the frame (5-10 % of the Vision Pro's frames in heavy games, 2026-10-13). Re-stamping with
             // the next sample fixes that on the Quest but trembles on the Vision Pro: parked in branch exp/restamp-2026-10-13 until
             // the visionOS client handles it.
-            const uint64_t clientTs = FrameClientTimestamp(layers);
+            // Arm 2: a submit that released nothing shows the previous frame's picture, so it leaves with that frame's timestamp (a true
+            // repeat, which the headset shows as one: 1.3.10 strobe test), whatever poses the app put on it; the pose matching is skipped so
+            // its state (the previous frame's timestamp, never going back) stays the real frames'.
+            const bool restamp = idArm >= 2 && nothingReleased && m_idHaveLastTs;
+            // Arm 3: each eye mapped by its own render pose (OpenXR gives every projection view its own pose; alternate-eye rendering mods
+            // submit one eye a frame older than the other). Off (identity, as arm 2) when the eyes share an orientation: every normal game.
+            OVR::Quatf eyeSrc[ovrEye_Count];
+            const bool haveEyes = DeclaredEyeOrientations(layers, eyeSrc);
+            m_eyeMap = (idArm >= 3 && haveEyes) ? ComputeEyeMap(layers, eyeSrc) : EyeMap{};
+            const uint64_t clientTs = restamp ? m_idLastTs
+                                              : FrameClientTimestamp(layers, m_eyeMap.on ? m_eyeMap.ref : 0, m_eyeMap.on ? &m_eyeMap.src[m_eyeMap.ref] : nullptr);
+            m_idRestamped += restamp ? 1 : 0;
+            m_idLastTs = clientTs;
+            m_idHaveLastTs = true;
 
             bool ok = true;
             if (m_mirrorRTV) {
@@ -1713,6 +1776,13 @@ namespace {
                             (unsigned long long)m_slotBusyWaits.load(), (unsigned)m_ipc.state->host.slotBusyMask, (unsigned)m_ipc.state->host.appPeriodMul,
                             m_ipc.state->host.appMinPeriodUs ? 1e6 / (double)m_ipc.state->host.appMinPeriodUs : 0.0, (unsigned long long)m_capHolds,
                             (unsigned long long)m_dupSeen, (unsigned long long)m_dupDropped, m_ipc.state->host.dropDuplicateFrames ? "on" : "off", m_dupPerReal.load(), (unsigned long long)m_freeWaits);
+                    ShimLog("identity: arm %u, submits %llu, same poses with an image released %llu, new poses with nothing released %llu, "
+                            "re-stamped %llu, without runtime facts %llu, with several %llu; eyes mapped by their own poses %llu (right eye newer %llu, "
+                            "angle mean %.3f max %.3f deg)",
+                            idArm, (unsigned long long)m_idSubmits, (unsigned long long)m_idSamePoseReleased, (unsigned long long)m_idStalePose,
+                            (unsigned long long)m_idRestamped, (unsigned long long)m_idNoFacts, (unsigned long long)m_idMultiFacts,
+                            (unsigned long long)m_eyeMapSubmits, (unsigned long long)m_eyeMapRightRef,
+                            m_eyeMapSubmits ? m_eyeMapAngleSum / (double)m_eyeMapSubmits * 57.29578 : 0.0, m_eyeMapAngleMax * 57.29578);
                     auto pct = [](std::vector<float>& v, double q) {
                         if (v.empty()) {
                             return 0.0f;
@@ -1772,6 +1842,7 @@ namespace {
                     const double releaseS = TakeFrameRelease();
                     PendingFrame pf{slot, clientTs, composeStart, releaseS, trace};
                     FrameRenderOrientation(layers, pf.renderQ, pf.hasProjection);
+                    MappedOrientation(pf.renderQ);
                     pf.displayS = displayS;
                     m_publishQueue.push_back(pf);
                     lock.unlock();
@@ -1782,6 +1853,7 @@ namespace {
                     float renderQ[2][4];
                     bool hasProjection = false;
                     FrameRenderOrientation(layers, renderQ, hasProjection);
+                    MappedOrientation(renderQ);
                     PublishFrame(slot, clientTs, composeStart, TakeFrameRelease(), trace, renderQ, hasProjection, displayS);
                 }
             }
@@ -1837,6 +1909,16 @@ namespace {
                     hasProjection = true;
                     return;
                 }
+            }
+        }
+
+        // Arm 3: the composed eyes stand for the mapped orientations, not the ones the app rendered with.
+        void MappedOrientation(float q[2][4]) const {
+            if (!m_eyeMap.on) {
+                return;
+            }
+            for (int e = 0; e < 2; e++) {
+                q[e][0] = m_eyeMap.target[e].x; q[e][1] = m_eyeMap.target[e].y; q[e][2] = m_eyeMap.target[e].z; q[e][3] = m_eyeMap.target[e].w;
             }
         }
 
@@ -1980,11 +2062,131 @@ namespace {
             }
         }
 
+        // Arm 3 (ipc labIdentity 3, docs/PLAN_UNIVERSAL_OPENXR.md): each eye of the projection layers is drawn rotated from the pose it was
+        // rendered with to the frame's pose, the head pose of the reference eye (the newer one, by the tracking samples the two poses match).
+        // The stream carries one pose per frame (ALVR v20) and the headset reprojects the whole frame by it; rotations compose, so a picture
+        // that one eye kept from the frame before (alternate-eye rendering) lands where its own pose looked. Rotation only: the eyes' position
+        // difference beyond the eye offset is not corrected (no depth). Off when the two eyes' head orientations agree within kEyeMapMinAngle.
+        struct EyeMap {
+            bool on{false};
+            int ref{0};
+            OVR::Quatf target[ovrEye_Count];   // the orientation each eye is drawn for: the reference head orientation * that eye's eye-to-head rotation
+            OVR::Quatf src[ovrEye_Count];      // the orientation each eye of `layer` was rendered with, as declared
+            const void* layer{nullptr};        // the first projection layer, the one `src` describes
+            double angle{0.0};                 // between the two eyes' head orientations, rad
+        };
+        static constexpr double kEyeMapMinAngle = 1e-4;   // rad (~0.006 degree, ~0.2 px at the Vision Pro's density): below it the eyes agree
+        EyeMap m_eyeMap;
+        uint64_t m_eyeMapSubmits{0}, m_eyeMapRightRef{0};
+        double m_eyeMapAngleSum{0.0}, m_eyeMapAngleMax{0.0};
+
+        static double QuatAngle(const OVR::Quatf& a, const OVR::Quatf& b) {   // the rotation angle between two orientations, rad
+            const OVR::Quatf d = a.Inverted() * b;
+            const double v = std::sqrt((double)d.x * d.x + (double)d.y * d.y + (double)d.z * d.z);
+            return 2.0 * std::atan2(v, std::abs((double)d.w));
+        }
+
+        // The newest tracking sample (not behind the previous frame's) whose orientation matches `head` within 0.5 degree, as
+        // FrameClientTimestamp picks it but without its side effects; 0 when none does.
+        uint64_t MatchSampleTs(const OVR::Quatf& head) {
+            std::lock_guard lock(m_lastHeadMutex);
+            uint64_t bestTs = 0;
+            double best = 0.0087;
+            for (size_t k = 0; k < m_poseRingCount; k++) {
+                const PoseSample& p = m_poseRing[(m_poseRingHead + kPoseRing - 1 - k) % kPoseRing];   // newest first
+                if (p.clientTsNs < m_lastFrameTsNs) {
+                    continue;
+                }
+                const double a = QuatAngle(p.orientation, head);
+                if (a < best - 2e-6) {
+                    best = a;
+                    bestTs = p.clientTsNs;
+                }
+            }
+            return bestTs;
+        }
+
+        // The orientation each eye of the first projection layer was rendered with, as the app declares it. False without a projection layer.
+        static bool DeclaredEyeOrientations(const std::vector<const ovrLayerHeader*>& layers, OVR::Quatf out[ovrEye_Count]) {
+            for (const ovrLayerHeader* h : layers) {
+                if (h && (h->Type == ovrLayerType_EyeFov || h->Type == ovrLayerType_EyeFovDepth)) {
+                    const ovrLayerEyeFov* l = (const ovrLayerEyeFov*)h;
+                    for (int e = 0; e < ovrEye_Count; e++) {
+                        out[e] = OVR::Quatf(l->RenderPose[e].Orientation);
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // VR guard (once per game, at its session creation and at its first submit): settings outside AirFrameXR known to break VR in the game's
+        // process, reported in the run log and to the streamer (ipc shim.vrGuard -> the game_ended event -> a red line in its window).
+        // Bit 0: NVIDIA Smooth Motion (the driver's frame generation, NvPresent64.dll in the game's present path): it presents an extra flat frame
+        // per game frame and, after a warm-up, presents from its own thread, so a VR mod that submits from the game's Present repeats every
+        // picture and later loses step with the game's rendering (2026-11-24). Not loaded when Smooth Motion is off for the game.
+        void VrGuardCheck(const char* when) {
+            if (!m_ipc.state) {
+                return;
+            }
+            uint32_t flags = 0;
+            if (GetModuleHandleW(L"NvPresent64.dll")) {
+                flags |= 1u;
+            }
+            const uint32_t fresh = flags & ~m_vrGuard;
+            m_vrGuard |= flags;
+            m_ipc.state->shim.vrGuard = m_vrGuard;
+            if (fresh & 1u) {
+                shimlog::General("WARN", "VR guard (%s): NVIDIA Smooth Motion is active for this game (NvPresent64.dll is loaded). It presents extra flat frames and "
+                                 "later moves the game's Present onto its own thread, which breaks VR mods that submit from Present. Turn it off: NVIDIA App > "
+                                 "Graphics > this game > Smooth Motion.", when);
+            }
+        }
+        uint32_t m_vrGuard{0};
+        bool m_vrGuardSubmitChecked{false};
+
+        EyeMap ComputeEyeMap(const std::vector<const ovrLayerHeader*>& layers, const OVR::Quatf src[ovrEye_Count]) {
+            EyeMap m;
+            const ovrLayerEyeFov* l = nullptr;
+            for (const ovrLayerHeader* h : layers) {
+                if (h && (h->Type == ovrLayerType_EyeFov || h->Type == ovrLayerType_EyeFovDepth)) {
+                    l = (const ovrLayerEyeFov*)h;
+                    break;
+                }
+            }
+            // a layer drawn for one eye only gives no pose for the other
+            if (!l || (l->Header.Flags & (kLayerFlagDisableLeft | kLayerFlagDisableRight)) != 0) {
+                return m;
+            }
+            OVR::Quatf head[ovrEye_Count];
+            for (int e = 0; e < ovrEye_Count; e++) {
+                m.src[e] = src[e];
+                head[e] = src[e] * OVR::Quatf(m_eyePose[e].Orientation).Inverted();
+                head[e].Normalize();
+            }
+            m.layer = l;
+            m.angle = QuatAngle(head[0], head[1]);
+            if (!(m.angle > kEyeMapMinAngle)) {
+                return m;
+            }
+            const uint64_t ts0 = MatchSampleTs(head[0]), ts1 = MatchSampleTs(head[1]);
+            m.ref = ts1 > ts0 ? 1 : 0;   // the newer eye names the frame; neither matched: the left, as today
+            for (int e = 0; e < ovrEye_Count; e++) {
+                m.target[e] = head[m.ref] * OVR::Quatf(m_eyePose[e].Orientation);
+            }
+            m.on = true;
+            m_eyeMapSubmits++;
+            m_eyeMapRightRef += m.ref;
+            m_eyeMapAngleSum += m.angle;
+            m_eyeMapAngleMax = std::max(m_eyeMapAngleMax, m.angle);
+            return m;
+        }
+
         // Client tracking timestamp to send this frame with: the one of the head pose the projection layer was rendered with.
         // Like ALVR's own SteamVR driver (PoseHistory::GetBestPoseMatch), match the layer's RenderPose against the poses the
         // app read; "the last pose read" is wrong for engines that read the next frame's pose before submitting this one
         // (render-thread pipelining), and the headset then reprojects the frame against the wrong pose.
-        uint64_t FrameClientTimestamp(const std::vector<const ovrLayerHeader*>& layers) {
+        uint64_t FrameClientTimestamp(const std::vector<const ovrLayerHeader*>& layers, int refEye = 0, const OVR::Quatf* refSrc = nullptr) {
             const ovrLayerEyeFov* eye = nullptr;
             for (const ovrLayerHeader* h : layers) {
                 if (h && (h->Type == ovrLayerType_EyeFov || h->Type == ovrLayerType_EyeFovDepth)) {
@@ -1996,8 +2198,10 @@ namespace {
             bool matched = false;
             if (eye) {
                 // eye orientation = head orientation * eye-to-head rotation (identity for ALVR's orthogonal views)
-                const OVR::Quatf target =
-                    OVR::Quatf(eye->RenderPose[0].Orientation) * OVR::Quatf(m_eyePose[ovrEye_Left].Orientation).Inverted();
+                // refEye: the eye whose pose names the frame (arm 3: the newer of two eyes rendered with different poses; else the left)
+                // refSrc: the orientation the reference eye's picture was rendered with (the eye map's source), when given
+                const OVR::Quatf target = (refSrc ? *refSrc : OVR::Quatf(eye->RenderPose[refEye].Orientation)) *
+                                          OVR::Quatf(m_eyePose[refEye].Orientation).Inverted();
                 std::lock_guard lock(m_lastHeadMutex);
                 auto sample = [&](size_t k) -> const PoseSample& { // k = 0 is the newest
                     return m_poseRing[(m_poseRingHead + kPoseRing - 1 - k) % kPoseRing];
@@ -2220,6 +2424,7 @@ namespace {
             {
                 const std::wstring name = shimlog::ExeName();
                 wcsncpy_s(m_ipc.state->shim.appExe, name.c_str(), _TRUNCATE);
+                m_ipc.state->shim.vrGuard = 0;   // this game's own findings only (VrGuardCheck)
                 // the desktop mirror (mirrordesktop.exe, an app like any other) holds the headset between games: any other app starting tells it to leave
                 if (_wcsicmp(name.c_str(), L"mirrordesktop.exe") != 0) {
                     if (HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\AirFrameXR_GameStarting")) { SetEvent(ev); CloseHandle(ev); ShimLog("start: told the desktop mirror to leave"); }
@@ -2875,12 +3080,16 @@ namespace {
         ovrPosef m_dupLastPose[2]{};               // render poses of the previous submitted frame (duplicate-frame check, SubmitFrame)
         bool m_dupPoseValid{false};
         uint32_t m_dupWinTotal{0}, m_dupWinSeen{0}, m_dupPatternWindows{0};
-        double m_dupLastPassS{0.0};                // when SubmitFrame last let a frame through while the duplicate check ran
         std::atomic<int> m_dupPerReal{0};          // confirmed duplicate pattern: extra submits per real frame (1 or 2), 0 = none (the fix idles)
         std::atomic<int> m_freeBudget{0};          // waits after the last real submit that return at once (WaitForVsync)
         uint64_t m_freeWaits{0};                   // waits of a duplicate cycle returned at once (pacing fix)
         bool m_vdxrInfoNoneLogged{false};          // the "no per-frame facts from the runtime" line was printed once (vdxrinfo)
-        uint64_t m_dupSeen{0}, m_dupDropped{0};    // frames with the previous frame's exact render poses / of those, the ones not published
+        uint64_t m_dupSeen{0}, m_dupDropped{0};    // submits the repeat decision called repeats / dropped (always 0 since 2026-11-24: nothing is dropped; kept for the log format)
+        // frame-identity lab (ipc labIdentity, SubmitFrame; the identity statistics line): submits, those without runtime facts or with several,
+        // same poses with an image released, new poses with nothing released, and the ones arm 2 sent with the previous frame's timestamp
+        uint64_t m_idSubmits{0}, m_idNoFacts{0}, m_idMultiFacts{0}, m_idSamePoseReleased{0}, m_idStalePose{0}, m_idRestamped{0};
+        uint64_t m_idLastTs{0};                    // the timestamp the previous published frame left with
+        bool m_idHaveLastTs{false};
         std::atomic<double> m_appTimeS{0.004};     // envelope of release -> frame GPU-complete (published), seconds
         long long m_lastTargetBoundary{0};         // boundary (tick index) the last release aimed at: one release per boundary
         double m_latestTickS{0.0};                 // shim-clock time of the host's latest display tick (under m_frameMutex)

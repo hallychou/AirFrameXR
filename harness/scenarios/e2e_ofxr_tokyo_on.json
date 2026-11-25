@@ -1,5 +1,5 @@
 {
-  "description": "Frame generation ON at 2/3 (the game held to 67 fps, outputs interpolated and restamped), a free-running game at 60-75 fps, 100 Hz host. Client: Vision Pro display emulation at 100 Hz with the latency model (network 2.5 / decode 7 / draw 2 ms, each mean + Gaussian). Eye size 1280x1120: the 3080 Ti laptop's single NVENC engine cannot encode 3520x1600 at 100 fps (encode ~10 ms), which capped both runs near 88-93 fps.",
+  "description": "OFXR LAB (real layer, V551 build in C:\\_ofxr, see docs): xr_probe with the Littlest Tokyo scene and a CPU cost of 22 ms per frame (a game at about half the 90 Hz display, the case OFXR is made for) through the full chain to the mock Vision Pro display (90 Hz). OFXR loaded as an explicit API layer (frame generation 2X), maximum OpenXR compatibility mode (drop_duplicate_frames) OFF.",
   "topology": {
     "host": "builder",
     "client": "builder",
@@ -9,10 +9,10 @@
   "session_overrides": {
     "session_settings.video.foveated_encoding.enabled": false,
     "openvr_config.enable_foveated_encoding": false,
-    "openvr_config.eye_resolution_width": 1280,
-    "openvr_config.eye_resolution_height": 1120,
-    "openvr_config.target_eye_resolution_width": 1280,
-    "openvr_config.target_eye_resolution_height": 1120,
+    "openvr_config.eye_resolution_width": 1760,
+    "openvr_config.eye_resolution_height": 1600,
+    "openvr_config.target_eye_resolution_width": 1760,
+    "openvr_config.target_eye_resolution_height": 1600,
     "session_settings.connection.client_recv_buffer_bytes": {
       "variant": "Custom",
       "Custom": 16777216
@@ -24,10 +24,10 @@
     "session_settings.video.transcoding_view_resolution": {
       "Scale": 1.0,
       "Absolute": {
-        "width": 1280,
+        "width": 1760,
         "height": {
           "set": true,
-          "content": 1120
+          "content": 1600
         }
       },
       "variant": "Absolute"
@@ -35,10 +35,10 @@
     "session_settings.video.emulated_headset_view_resolution": {
       "Scale": 1.0,
       "Absolute": {
-        "width": 1280,
+        "width": 1760,
         "height": {
           "set": true,
-          "content": 1120
+          "content": 1600
         }
       },
       "variant": "Absolute"
@@ -46,49 +46,45 @@
   },
   "host": {
     "shim": true,
-    "fps": 100,
-    "seconds": 70,
+    "fps": 90,
+    "seconds": 100,
     "connect_timeout": 45,
     "gpu_keepalive": 90,
     "exit_after_frames": 100000,
-    "frame_gen": "on",
     "running_start_ms": 2.0,
-    "frame_gen_rate": "two_thirds"
+    "frame_gen": "off",
+    "drop_duplicate_frames": false,
+    "debug": true
   },
   "client": {
-    "seconds": 65,
+    "seconds": 100,
     "connect_timeout": 45,
     "yaw_amp": 0.5,
     "yaw_hz": 0.25,
     "display_sim": true,
-    "display_hz": 100,
-    "poll_ms": 5.0,
+    "poll_ms": 5,
     "queue_max": 2,
-    "motion": "yaw",
-    "net_ms": 2.5,
-    "net_sd_ms": 1.0,
-    "decode_ms": 7,
-    "decode_sd_ms": 1.0,
-    "draw_ms": 2.0,
-    "draw_sd_ms": 0.7
+    "motion": "yaw"
   },
   "client_env": {
     "RUST_LOG": "warn"
   },
   "app": {
-    "frames": 3600,
-    "timeout_s": 75,
+    "frames": 3000,
+    "timeout_s": 110,
     "env": {
-      "XR_PROBE_CPU_MS": "1",
-      "XR_PROBE_GPU_COPIES": "0",
-      "XR_PROBE_LOAD": "fps:60:75"
+      "XR_PROBE_SCENE": "bench\\littlest_tokyo.vab",
+      "XR_PROBE_CPU_MS": "22",
+      "XR_API_LAYER_PATH": "C:\\_ofxr\\lab",
+      "XR_ENABLE_API_LAYERS": "XR_APILAYER_XRFrameBridge_diagnostic"
     }
   },
   "gpu_sample": true,
-  "timeout_s": 200,
+  "timeout_s": 300,
   "checks": {
-    "host_min_frames": 250,
-    "client_min_frames": 200,
-    "max_duplicate_timestamps": 100000
+    "host_min_frames": 600,
+    "client_min_frames": 600,
+    "ts_report": true,
+    "max_duplicate_timestamps": 1000000
   }
 }

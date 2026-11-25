@@ -23,17 +23,19 @@ EXPECT = {
         ("after_run", ["last session, LiesOfP.exe, 1.5 min, Apple Vision Pro", "44.8 fps", "57 ms"], []),
         ("idle_status_after", ["last session, LiesOfP.exe", "44.8 fps"], ["Streaming (live"]),   # a status with no game never replaces the last session's numbers
     ],
+    "vr_guard": [   # the VR guard (2026-11-24): a red line after a game that ran with NVIDIA Smooth Motion; the next clean game clears it
+        ("guard", ["NVIDIA frame generation (Smooth Motion) was active in ACBlackFlag.exe", "Turn it off"], []),
+        ("clean", [], ["Smooth Motion"]),
+    ],
     "absurd_latency": [
         ("live_absurd", ["n/a", "not measured"], ["4958802102", "137"]),
         ("run_absurd", ["n/a", "not measured"], ["4958802102", "29752812252"]),
         ("run_clean", ["57 ms", "p95 70"], ["n/a"]),   # 2 outliers of 800 samples: still believable
     ],
     "controls_avp": [
-        ("avp_auto", ["headset reports 1.62 m", "Eye height", "Debug logging", "Export logs...", "Open logs folder", "Features", "Frame generation", "Position", "Picture", "Desktop mirror", "button \u2630", "x1.5", "x2", "x3"], ["Between games", "vectors", "1/3", "1/2", "2/3"]),
+        ("avp_auto", ["headset reports 1.62 m", "Eye height", "Debug logging", "Export logs...", "Open logs folder", "Features", "Frame generation", "Position", "Picture", "Desktop mirror", "button \u2630", "x2", "x3"], ["Between games", "vectors", "1/3", "1/2", "2/3", "x1.5", "Uncapped"]),
         ("frame_gen_on", ["sent frame_gen on"], []),
-        ("rate", ["sent frame_gen_rate two_thirds"], []),
-        ("uncapped_on", [], []),   # the Uncapped tick lives in the Advanced window since 2026-10-23 (hidden in the streamer): nothing here to drive or read
-        ("uncapped_off", [], []),
+        ("rate", ["sent frame_gen_rate third"], []),
         ("recenter", ["sent recenter"], []),
         ("manual", ["sent height 1.30"], ["headset reports"]),
         ("height", ["sent height 1.55"], []),

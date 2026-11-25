@@ -644,6 +644,8 @@ int nvh_ipc_wait_frame(void* i, int timeout_ms, uint64_t* counter, uint32_t* slo
     return 1;
 }
 
+uint32_t nvh_ipc_vr_guard(void* i) { return ((Ipc*)i)->state->shim.vrGuard; }
+
 int nvh_ipc_shim_alive(void* i) {
     auto& s = ((Ipc*)i)->state->shim;
     static uint32_t lastBeat = 0; static double lastChange = 0;
@@ -765,9 +767,8 @@ int nvh_fg_enable(void* hh, int on, double flow_scale, int perf_level, int grid,
     if (!on) return 1;
     auto fg = std::make_unique<FrameGen>(n->render->GetDevice(), n->render->GetContext());
     FrameGenConfig c;
-    c.flowScale = (float)flow_scale; c.perfLevel = perf_level; c.grid = grid; c.synth = synth == 1 ? 1 : 0;
-    if (synth == 2) { c.synth = 1; c.photoScale = 0.f; }   // edge-blend: the edge synthesis without the photometric gate
-    if (synth == 4) { c.synth = 1; c.neural = 1; }          // neural (default since 1.4.2): the edge synthesis composing from RIFE 4.4's fields
+    c.flowScale = (float)flow_scale; c.perfLevel = perf_level; c.grid = grid;
+    if (synth == 4) c.neural = 1;   // neural (the default): the edge synthesis's output pass composing from RIFE 4.4's fields
     // edge synthesis tuning (lab knobs, env only)
     if (const char* v = getenv("AIRFRAMEXR_FG_MOTION_LIMIT")) c.motionLimit = (float)atof(v);
     if (const char* v = getenv("AIRFRAMEXR_FG_COST_SCALE")) c.costScale = (float)atof(v);
@@ -844,6 +845,7 @@ int nvh_fg_stats(void* hh, char* buf, int len) {
 
 void nvh_ipc_set_app_min_period(void* i, uint32_t us) { ((Ipc*)i)->state->host.appMinPeriodUs = us; }
 void nvh_ipc_set_drop_duplicates(void* i, uint32_t on) { ((Ipc*)i)->state->host.dropDuplicateFrames = on; }
+void nvh_ipc_set_lab_identity(void* i, uint32_t arm) { ((Ipc*)i)->state->host.labIdentity = arm; }   // the frame-identity lab arm (ipc.h)
 
 void nvh_ipc_set_user(void* i, float user_gamma, int debug_on, const wchar_t* debug_dir) {
     auto& h = ((Ipc*)i)->state->host;

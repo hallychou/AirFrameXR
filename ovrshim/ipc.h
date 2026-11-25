@@ -15,7 +15,7 @@
 namespace airframexr_ipc {
 
 constexpr uint32_t kMagic = 0x56414C31; // 'VAL1'
-constexpr uint32_t kVersion = 38;   // 38 (1.4-foundation E4): renderCeiling removed
+constexpr uint32_t kVersion = 40;   // 40 (universal-1.4 candidate): shim.vrGuard; 39 (universal-1.4 Phase B): labIdentity; 38 (1.4-foundation E4): renderCeiling removed
 constexpr int kSlots = 6;   // SBS ring: the host holds up to 2 (newest + encoding), 2 may be in flight on the GPU
 
 struct Pose {
@@ -108,8 +108,7 @@ struct HostToShim {
     // other compositor boundary; the host interpolates the frame in between from the optical flow of the last two rendered frames) and its
     // predicted display time moves one display period later (an interpolated frame is shown before each rendered one). 0 or 1 = every boundary.
     uint32_t appPeriodMul;
-    // Uncapped frame generation (docs/FRAME_GENERATION_UNCAPPED.md): the app is paced at every boundary (appPeriodMul 1) and may be held to a
-    // minimum spacing between releases (an fps cap chosen by the user: headroom for the host's own GPU work). 0 = no cap.
+    // The game fps lock (`video.frame_gen_cap_fps`): a minimum spacing between releases, in every mode, chosen by the user. 0 = no lock.
     uint32_t appMinPeriodUs;
     // the field of view the GAME is told, as fractions of the headset's tangents (eyeFovTan): outer (the side away from the nose), inner, upper, lower; 1 = all of it.
     // The stream frame keeps covering the headset's whole FoV (the client maps it over the FoV it declared); an app that started later takes new values.
@@ -122,6 +121,15 @@ struct HostToShim {
     uint32_t dropDuplicateFrames;
     // The host's log verbosity (logsink.rs Level: 0 error, 1 warn, 2 info, 3 verbose, 4 debug): the shim filters its own lines with it, before it formats them.
     uint32_t logLevel;
+    // Frame-identity lab arm (docs/PLAN_UNIVERSAL_OPENXR.md Phase B; host --lab-identity N / stdin `lab_identity N`; no GUI, no config file):
+    // 0 = 1.5's rule (a duplicate = the previous submit's exact render poses); 1 = U1: a duplicate needs the same poses AND the runtime's word
+    // that no image was released since the previous frame; 2 = U1, and a submit that released nothing goes out with the previous frame's
+    // timestamp whatever its poses (the picture keeps the pose it was first submitted with); 3 (the default) = arm 2, and each eye of the projection layers is drawn rotated from its own render pose to the frame's (the newer eye's)
+    // when the two eyes were rendered with different head orientations (alternate-eye rendering; normal games: identity, as arm 2). Arm 4 (an eye
+    // with no new image keeping its earlier pose) was tried on 2026-11-24 and removed: its field case was a configuration mistake.
+    // No arm drops anything (since 2026-11-24: the compatibility mode only frees waits). Without the runtime's per-frame facts (stock VDXR,
+    // a libOVR game) arms 1-3 call no submit a duplicate; arm 0 still decides by the poses.
+    uint32_t labIdentity;
 };
 
 struct Haptic {
@@ -157,6 +165,7 @@ struct ShimToHost {
     uint64_t gateHolds;            // releases the intake gate skipped for a standing host queue (see HostToShim::intakeGate)
     uint64_t gateSuppressed;       // standing queue seen while the gate was quiet after a skip (its effect still in flight)
     int32_t recommendedW, recommendedH;   // the per-eye render size the shim told the app (GetRecommendedResolution), for the host's run record
+    uint32_t vrGuard;              // VR guard findings for the running game (bit 0: NVIDIA Smooth Motion active); reset at the game's start
 };
 
 // The shim's log lines travel to the host (its writer thread owns every log file: no disk write on the game's threads, no concurrent appends,

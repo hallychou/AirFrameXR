@@ -6,6 +6,7 @@
   python3 harness/run.py build [host|client|shim|probe|package|vdxr|nvenc ...]; test-install     # (re)build binaries on the builder
   python3 harness/run.py run  <scenario> [<scenario> ...]
   python3 harness/run.py all                               # every scenario, non-zero exit if any fail
+  python3 harness/run.py identity [<scenario> ...]         # the frame-identity matrix (scenarios/identity), one table (docs/PLAN_UNIVERSAL_OPENXR.md)
   python3 harness/run.py report [results_dir]              # re-evaluate saved artifacts (no builder needed)
   python3 harness/run.py bench-quality [quick|full] [--qp on|off] [--eye WxH] [--mbps N]   # benchmark phase 2 headless on the builder + sanity checks
   python3 harness/run.py test-zip                          # unzip the package into a fresh folder and run from it (logs, debug, config)
@@ -30,6 +31,8 @@ def load(name):
         p = SCEN / "pacing" / f"{name}.json"        # pacing lab (`run.py pacing`), not part of `all`
     if not p.exists():
         p = SCEN / "pacing" / "exp" / f"{name}.json"   # experiments (named explicitly)
+    if not p.exists():
+        p = SCEN / "identity" / f"{name}.json"      # frame-identity matrix (`run.py identity`), not part of `all`
     if not p.exists():
         raise SystemExit(f"unknown scenario {name}; available: {', '.join(x.stem for x in sorted(SCEN.glob('*.json')))}")
     sc = json.load(open(p))
@@ -475,6 +478,38 @@ def main(argv):
         hdr = ["scenario", "status", "app_fps", "repeat%", "skip%", "dwell_p05", "dwell_p50", "dwell_p95", "empty", "superseded", "overruns", "send_late", "app_env_ms", "rel_late", "age_p50/p95/max", "same_ts"]
         w = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(hdr)]
         print("\n== pacing lab (reference SteamVR + ALVR on the headset: repeat 3.4 %, dwell 9-11 ms)")
+        print("  ".join(h.ljust(w[i]) for i, h in enumerate(hdr)))
+        for r in rows:
+            print("  ".join(c.ljust(w[i]) for i, c in enumerate(r)))
+        return 0 if all(r[1] == "PASS" for r in rows) else 1
+    if cmd == "identity":          # the frame-identity matrix (docs/PLAN_UNIVERSAL_OPENXR.md): every scenarios/identity/*.json (or the named ones), one table
+        names = argv[2:] or [p.stem for p in sorted((SCEN / "identity").glob("*.json"))]
+        rows = []
+        for n in names:
+            run_one(n)
+            d = lib.RESULTS / "latest"
+            a = json.load(open(d / "analysis.json")) if (d / "analysis.json").exists() else {}
+            r = json.load(open(d / "result.json"))
+            I = a.get("identity") or {}
+            W, V, S = I.get("window") or {}, I.get("vdxr") or {}, I.get("shim") or {}
+            if not I:   # a row without the app's truth (the real OFXR layer on xr_probe): VDXR's and the shim's counts alone
+                V = a.get("vdxr_trace") or {}
+                S = (a.get("modsim") or {}).get("shim") or {}
+            w = max(W.get("submits") or 0, 1)
+            pc = lambda k: f'{100.0 * (W.get(k) or 0) / w:.0f}' if W else "-"
+            A = (I.get("shim_identity") or {})   # the arm the shim ran (its identity line; absent before IPC 39)
+            T = a.get("identity_stamp") or {}   # plan 5b: share of received frames showing a picture under another pose, before / after the late shapes
+            sh = lambda p: f'{100.0 * p["share"]:.1f}' if p and p.get("frames") else "-"
+            rows.append([n, r["status"], str(W.get("submits", "-")), pc("true_dup"), pc("same_pose_new_pic"), pc("re_released"), pc("stale_pose"), pc("one_eye"),
+                         f'{V.get("resubmits", "-")}/{W.get("no_release", "-")}', f'{S.get("dups_seen", "-")}/{S.get("dups_dropped", "-")}', str(S.get("free_waits", "-")),
+                         str(I.get("pause_wait_rate_hz", I.get("wait_rate_hz", "-"))),
+                         f'{sh(T.get("before"))}/{sh(T.get("after"))}' if T else "-",
+                         str(A.get("arm", "-")) + (f'/r{A["restamped"]}' if A.get("restamped") else "") + (f'/nf{A["no_facts"]}' if A.get("no_facts") else "") + (f'/mf{A["multi_facts"]}' if A.get("multi_facts") else ""),
+                         ",".join(c["name"] for c in r.get("checks", []) if not c["ok"]) or "-"])
+        hdr = ["scenario", "status", "submits", "true_dup%", "samepose_new%", "rereleased%", "stale%", "one_eye%", "vdxr/app_norel", "seen/dropped", "free_waits",
+               "wait_hz", "stamp_err% b/a", "arm", "failed checks"]
+        w = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(hdr)]
+        print(f"\n== frame-identity matrix, arm requested {os.environ.get('AIRFRAMEXR_LAB_IDENTITY', '0 (default)')} (AIRFRAMEXR_LAB_IDENTITY; the arm column is what the shim reported: arm/re-stamped/no facts/several facts)")
         print("  ".join(h.ljust(w[i]) for i, h in enumerate(hdr)))
         for r in rows:
             print("  ".join(c.ljust(w[i]) for i, c in enumerate(r)))
